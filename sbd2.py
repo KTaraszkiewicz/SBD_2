@@ -1,846 +1,783 @@
-import pickle
-import os
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
+import sys
 import random
+import pickle
+import math
+import os
+import struct
+import matplotlib.pyplot as plt
 
-# Statystyki operacji
-class Stats:
+# --- KONFIGURACJA SYMULACJI ---
+PAGE_SIZE = 512  # Stały rozmiar strony w bajtach (można zmienić np. na 1024, 4096)
+
+class DiskStats:
+    """Klasa pomocnicza do zliczania operacji dyskowych."""
     def __init__(self):
         self.reads = 0
         self.writes = 0
-    
+
     def reset(self):
         self.reads = 0
         self.writes = 0
-    
+
     def __str__(self):
         return f"Odczyty: {self.reads}, Zapisy: {self.writes}"
 
-stats = Stats()
+# Globalne statystyki
+stats = DiskStats()
 
-@dataclass
-class Record:
-    """Rekord zawierający klucz i dane (zbiór liczb)"""
-    key: int
-    numbers: List[int]
-    
-    def get_sum(self):
-        """Suma liczb - poprzednie kryterium sortowania"""
-        return sum(self.numbers)
-    
-    def __str__(self):
-        return f"[Key={self.key}, Numbers={self.numbers}, Sum={self.get_sum()}]"
-
-class BTreeNode:
-    """Węzeł B-drzewa"""
-    def __init__(self, is_leaf=True):
-        self.keys = []  # Lista kluczy
-        self.addresses = []  # Lista adresów rekordów w pliku głównym
-        self.children = []  # Lista wskaźników do dzieci (adresów stron)
-        self.is_leaf = is_leaf
-        self.parent_addr = None  # Adres rodzica (dla ułatwienia operacji)
-    
-    def is_full(self, max_keys):
-        return len(self.keys) >= max_keys
-    
-    def is_underflow(self, min_keys):
-        return len(self.keys) < min_keys
-
-class BTree:
-    """Implementacja B-drzewa"""
-    def __init__(self, filename="btree_data.db", d=2):
-        self.filename = filename
-        self.index_filename = filename + ".idx"
-        self.free_pages_filename = filename + ".free"
-        self.d = d  # Stopień drzewa
-        self.max_keys = 2 * d
-        self.min_keys = d
-        self.root_addr = None
-        self.next_page_addr = 0  # Następny wolny adres strony
-        self.free_pages = []  # Lista zwolnionych stron do ponownego użycia
+class DiskManager:
+    """
+    Symuluje dysk twardy na surowym pliku binarnym.
+    Plik jest podzielony na bloki o stałej wielkości (PAGE_SIZE).
+    Strona 0 jest zarezerwowana na metadane (Next_Page_ID, Root_ID).
+    """
+    def __init__(self, filename):
+        self.filename = filename + ".bin"
+        self.page_size = PAGE_SIZE
         
-        # Inicjalizacja plików
-        self._init_files()
-    
-    def _init_files(self):
-        """Inicjalizacja plików bazy danych"""
+        # Otwieramy plik w trybie binarnym do odczytu i zapisu
+        # Jeśli plik nie istnieje, tworzymy go i inicjalizujemy Superblock (strona 0)
         if not os.path.exists(self.filename):
             with open(self.filename, 'wb') as f:
-                pass
-        if not os.path.exists(self.index_filename):
-            with open(self.index_filename, 'wb') as f:
-                pass
-        if not os.path.exists(self.free_pages_filename):
-            self.free_pages = []
-            self._save_free_pages()
-        else:
-            self._load_free_pages()
-    
-    def _save_free_pages(self):
-        """Zapisz listę wolnych stron"""
-        with open(self.free_pages_filename, 'wb') as f:
-            pickle.dump(self.free_pages, f)
-        stats.writes += 1
-    
-    def _load_free_pages(self):
-        """Wczytaj listę wolnych stron"""
-        with open(self.free_pages_filename, 'rb') as f:
-            self.free_pages = pickle.load(f)
+                # Format: [Next_Page_ID (4B int)] [Root_ID (4B int)] [Padding...]
+                # -1 oznacza brak root_id
+                f.write(struct.pack('ii', 1, -1)) 
+                f.write(b'\x00' * (self.page_size - 8))
+        
+        self.file = open(self.filename, 'r+b')
+
+    def _read_metadata(self):
+        """Odczytuje Next_Page_ID i Root_ID ze strony 0."""
+        self.file.seek(0)
+        data = self.file.read(8)
+        return struct.unpack('ii', data)
+
+    def _write_metadata(self, next_page_id, root_id):
+        """Zapisuje metadane na stronie 0."""
+        self.file.seek(0)
+        self.file.write(struct.pack('ii', next_page_id, root_id))
+
+    def get_root_id(self):
+        """Pobiera ID korzenia (zastępuje dictionary['root_id'])."""
+        _, root_id = self._read_metadata()
+        return root_id if root_id != -1 else None
+
+    def set_root_id(self, root_id):
+        """Ustawia ID korzenia."""
+        next_id, _ = self._read_metadata()
+        self._write_metadata(next_id, root_id if root_id is not None else -1)
+
+    def get_next_page_id(self):
+        """Zwraca licznik stron (do iteracji)."""
+        next_id, _ = self._read_metadata()
+        return next_id
+
+    def read_page(self, page_id):
+        if page_id is None: return None
         stats.reads += 1
-    
-    def _get_new_page_addr(self):
-        """Pobierz adres dla nowej strony (z puli wolnych lub nowy)"""
-        if self.free_pages:
-            return self.free_pages.pop()
-        else:
-            addr = self.next_page_addr
-            self.next_page_addr += 1
-            return addr
-    
-    def _free_page_addr(self, addr):
-        """Zwolnij adres strony do ponownego użycia"""
-        self.free_pages.append(addr)
-        self._save_free_pages()
-    
-    def _write_node(self, addr, node):
-        """Zapisz węzeł do pliku indeksu"""
-        with open(self.index_filename, 'r+b') as f:
-            f.seek(addr * 4096)  # Zakładamy strony po 4KB
-            pickle.dump(node, f)
-        stats.writes += 1
-    
-    def _read_node(self, addr):
-        """Odczytaj węzeł z pliku indeksu"""
-        with open(self.index_filename, 'rb') as f:
-            f.seek(addr * 4096)
-            node = pickle.load(f)
-        stats.reads += 1
-        return node
-    
-    def _write_record(self, addr, record):
-        """Zapisz rekord do pliku głównego"""
-        with open(self.filename, 'r+b') as f:
-            f.seek(addr * 1024)  # Zakładamy rekordy po 1KB
-            pickle.dump(record, f)
-        stats.writes += 1
-    
-    def _read_record(self, addr):
-        """Odczytaj rekord z pliku głównego"""
-        with open(self.filename, 'rb') as f:
-            f.seek(addr * 1024)
-            record = pickle.load(f)
-        stats.reads += 1
-        return record
-    
-    def search(self, key):
-        """Wyszukaj rekord po kluczu"""
-        if self.root_addr is None:
+        
+        offset = page_id * self.page_size
+        self.file.seek(offset)
+        raw_data = self.file.read(self.page_size)
+        
+        # Jeśli odczytano puste bajty lub same zera (oznaczone jako usunięte), zwróć None
+        if not raw_data or raw_data == b'\x00' * self.page_size:
             return None
         
-        return self._search_recursive(self.root_addr, key)
-    
-    def _search_recursive(self, node_addr, key):
-        """Rekurencyjne wyszukiwanie w B-drzewie"""
-        node = self._read_node(node_addr)
+        try:
+            return pickle.loads(raw_data)
+        except (pickle.UnpicklingError, EOFError):
+            return None
+
+    def write_page(self, page_id, data_obj):
+        stats.writes += 1
+        next_id, root_id = self._read_metadata()
         
-        # Szukaj klucza w węźle
+        # Jeśli nie podano ID, przydziel nowe
+        if page_id is None:
+            page_id = next_id
+            next_id += 1
+            self._write_metadata(next_id, root_id)
+        
+        # Serializacja
+        serialized_data = pickle.dumps(data_obj)
+        
+        # Sprawdzenie czy dane mieszczą się w bloku
+        if len(serialized_data) > self.page_size:
+            # W realnym systemie tutaj nastąpiłaby fragmentacja lub overflow pages.
+            # W symulacji rzucamy błąd, sugerując zwiększenie PAGE_SIZE.
+            raise ValueError(f"CRITICAL: Obiekt za duży ({len(serialized_data)} B) dla strony ({self.page_size} B). Zwiększ PAGE_SIZE w kodzie.")
+            
+        # Padding (dopełnienie zerami do pełnego rozmiaru strony)
+        padding = b'\x00' * (self.page_size - len(serialized_data))
+        final_block = serialized_data + padding
+        
+        offset = page_id * self.page_size
+        self.file.seek(offset)
+        self.file.write(final_block)
+        
+        return page_id
+
+    def delete_page(self, page_id):
+        # Nadpisujemy zerami
+        offset = page_id * self.page_size
+        self.file.seek(offset)
+        self.file.write(b'\x00' * self.page_size)
+
+    def get_file_size(self):
+        """Zwraca rozmiar fizyczny pliku."""
+        self.file.flush()
+        return os.path.getsize(self.filename)
+
+    def close(self):
+        self.file.close()
+
+    def clear(self):
+        """Resetuje plik bazy."""
+        self.file.close()
+        if os.path.exists(self.filename):
+            os.remove(self.filename)
+        # Reinit
+        with open(self.filename, 'wb') as f:
+            f.write(struct.pack('ii', 1, -1)) 
+            f.write(b'\x00' * (self.page_size - 8))
+        self.file = open(self.filename, 'r+b')
+
+# --- STRUKTURY DANYCH ---
+
+class Record:
+    def __init__(self, key, numbers):
+        self.key = key
+        self.numbers = numbers
+        self.sum = sum(numbers)
+        self.is_deleted = False
+
+    def __repr__(self):
+        return f"[ID: {self.key} | Liczby: {self.numbers} | Suma: {self.sum}]"
+
+class BTreeNode:
+    def __init__(self, is_leaf=False):
+        self.is_leaf = is_leaf
+        self.keys = []      # Lista kluczy
+        self.values = []    # Adresy rekordów
+        self.children = []  # ID stron dzieci
+        
+    def __repr__(self):
+        return f"Node(Leaf={self.is_leaf}, Keys={self.keys})"
+
+# --- MANAGERY PLIKÓW ---
+
+class DataFileManager:
+    def __init__(self, disk):
+        self.disk = disk
+        self.free_pages = [] 
+
+    def insert_record(self, record):
+        page_id = None
+        if self.free_pages:
+            page_id = self.free_pages.pop()
+        real_id = self.disk.write_page(page_id, record)
+        return real_id
+
+    def read_record(self, page_id):
+        return self.disk.read_page(page_id)
+
+    def update_record(self, page_id, new_numbers):
+        record = self.read_record(page_id)
+        if record:
+            record.numbers = new_numbers
+            record.sum = sum(new_numbers)
+            self.disk.write_page(page_id, record)
+            return True
+        return False
+
+    def delete_record(self, page_id):
+        # Oznaczamy stronę jako wolną w managerze i czyścimy na dysku
+        self.free_pages.append(page_id)
+        self.disk.delete_page(page_id)
+
+# --- IMPLEMENTACJA B-DRZEWA ---
+
+class BTree:
+    def __init__(self, d, index_disk, data_manager):
+        self.d = d 
+        self.disk = index_disk
+        self.data_mgr = data_manager
+        
+        # Pobieramy ID korzenia z metadanych (strona 0)
+        self.root_id = self.disk.get_root_id()
+        
+        if self.root_id is None:
+            # Tworzenie nowego drzewa
+            root = BTreeNode(is_leaf=True)
+            self.root_id = self.disk.write_page(None, root)
+            self.disk.set_root_id(self.root_id)
+
+    def get_node(self, node_id):
+        return self.disk.read_page(node_id)
+
+    def save_node(self, node_id, node):
+        self.disk.write_page(node_id, node)
+
+    def update_root(self, new_root_id):
+        self.root_id = new_root_id
+        self.disk.set_root_id(self.root_id)
+
+    # --- WYSZUKIWANIE ---
+    def search(self, key, node_id=None):
+        if node_id is None: node_id = self.root_id
+        node = self.get_node(node_id)
+        if node is None: return None, None, None
+
         i = 0
         while i < len(node.keys) and key > node.keys[i]:
             i += 1
-        
-        # Znaleziono klucz
+
         if i < len(node.keys) and key == node.keys[i]:
-            record_addr = node.addresses[i]
-            return self._read_record(record_addr)
-        
-        # Jeśli liść, klucz nie istnieje
+            if node.is_leaf:
+                return self.data_mgr.read_record(node.values[i]), node_id, i
+            else:
+                return self.data_mgr.read_record(node.values[i]), node_id, i
+
         if node.is_leaf:
-            return None
-        
-        # Szukaj w odpowiednim dziecku
-        return self._search_recursive(node.children[i], key)
-    
-    def insert(self, record):
-        """Wstaw rekord do B-drzewa"""
-        # Sprawdź czy klucz już istnieje
-        if self.search(record.key) is not None:
-            print(f"Błąd: Klucz {record.key} już istnieje!")
+            return None, None, None 
+
+        return self.search(key, node.children[i])
+
+    # --- WSTAWIANIE ---
+    def insert(self, key, numbers):
+        rec, _, _ = self.search(key)
+        if rec:
+            print(f"Błąd: Klucz {key} już istnieje.")
             return False
+
+        new_record = Record(key, numbers)
+        try:
+            data_addr = self.data_mgr.insert_record(new_record)
+        except ValueError as e:
+            print(f"Błąd zapisu rekordu: {e}")
+            return False
+
+        root = self.get_node(self.root_id)
+        # Sprawdzenie przepełnienia korzenia
+        if len(root.keys) == (2 * self.d):
+            new_root = BTreeNode(is_leaf=False)
+            new_root.children.append(self.root_id)
+            self.split_child(new_root, 0)
+            
+            # Zaktualizuj ID korzenia
+            self.update_root(self.disk.write_page(None, new_root))
+            self.insert_non_full(new_root, key, data_addr)
+        else:
+            self.insert_non_full(root, key, data_addr)
+            self.save_node(self.root_id, root)
+        return True
+
+    def split_child(self, parent, index):
+        child_id = parent.children[index]
+        child = self.get_node(child_id)
         
-        # Zapisz rekord do pliku głównego
-        record_addr = self._get_new_page_addr()
-        with open(self.filename, 'ab') as f:
-            f.seek(record_addr * 1024)
-            pickle.dump(record, f)
-        stats.writes += 1
+        new_node = BTreeNode(is_leaf=child.is_leaf)
         
-        # Jeśli drzewo puste, utwórz korzeń
-        if self.root_addr is None:
-            root = BTreeNode(is_leaf=True)
-            root.keys.append(record.key)
-            root.addresses.append(record_addr)
-            self.root_addr = self._get_new_page_addr()
-            self._write_node(self.root_addr, root)
-            return True
+        mid_key = child.keys[self.d]
+        mid_val = child.values[self.d] if len(child.values) > self.d else None
+
+        new_node.keys = child.keys[self.d+1:]
+        new_node.values = child.values[self.d+1:]
+
+        if not child.is_leaf:
+            new_node.children = child.children[self.d+1:]
         
-        # Wstaw do istniejącego drzewa
-        self._insert_recursive(self.root_addr, record.key, record_addr)
+        child.keys = child.keys[:self.d]
+        child.values = child.values[:self.d]
+        if not child.is_leaf:
+            child.children = child.children[:self.d+1]
+
+        new_node_id = self.disk.write_page(None, new_node)
+        self.save_node(child_id, child)
+
+        parent.children.insert(index + 1, new_node_id)
+        parent.keys.insert(index, mid_key)
+        parent.values.insert(index, mid_val)
+
+    def insert_non_full(self, node_obj, key, data_addr):
+        i = len(node_obj.keys) - 1
+        if node_obj.is_leaf:
+            node_obj.keys.append(0)
+            node_obj.values.append(0)
+            while i >= 0 and key < node_obj.keys[i]:
+                node_obj.keys[i+1] = node_obj.keys[i]
+                node_obj.values[i+1] = node_obj.values[i]
+                i -= 1
+            node_obj.keys[i+1] = key
+            node_obj.values[i+1] = data_addr
+        else:
+            while i >= 0 and key < node_obj.keys[i]:
+                i -= 1
+            i += 1
+            
+            child_id = node_obj.children[i]
+            child = self.get_node(child_id)
+            
+            if len(child.keys) == 2 * self.d:
+                self.split_child(node_obj, i)
+                if key > node_obj.keys[i]:
+                    i += 1
+                child_id = node_obj.children[i]
+                child = self.get_node(child_id)
+            
+            self.insert_non_full(child, key, data_addr)
+            self.save_node(child_id, child)
+
+    # --- USUWANIE ---
+    def delete(self, key):
+        if self.search(key)[0] is None:
+            print(f"Klucz {key} nie istnieje.")
+            return False
+            
+        root = self.get_node(self.root_id)
+        self._delete_recursive(root, self.root_id, key)
+        
+        if len(root.keys) == 0 and not root.is_leaf:
+            self.disk.delete_page(self.root_id)
+            self.update_root(root.children[0])
         return True
     
-    def _insert_recursive(self, node_addr, key, record_addr):
-        """Rekurencyjne wstawianie do B-drzewa"""
-        node = self._read_node(node_addr)
-        
-        # Znajdź pozycję dla klucza
-        i = 0
-        while i < len(node.keys) and key > node.keys[i]:
-            i += 1
-        
-        if node.is_leaf:
-            # Wstaw do liścia
-            node.keys.insert(i, key)
-            node.addresses.insert(i, record_addr)
-            self._write_node(node_addr, node)
-            
-            # Sprawdź przepełnienie
-            if len(node.keys) > self.max_keys:
-                self._handle_overflow(node_addr)
-        else:
-            # Wstaw do odpowiedniego dziecka
-            child_addr = node.children[i]
-            self._insert_recursive(child_addr, key, record_addr)
-    
-    def _handle_overflow(self, node_addr):
-        """Obsłuż przepełnienie węzła"""
-        node = self._read_node(node_addr)
-        
-        # Spróbuj kompensacji
-        if self._try_compensation(node_addr):
-            return
-        
-        # Kompensacja niemożliwa - wykonaj podział
-        self._split_node(node_addr)
-    
-    def _try_compensation(self, node_addr):
-        """Spróbuj kompensacji z sąsiadem"""
-        node = self._read_node(node_addr)
-        
-        if node.parent_addr is None:
-            return False
-        
-        parent = self._read_node(node.parent_addr)
-        
-        # Znajdź pozycję węzła w rodzicu
-        node_idx = parent.children.index(node_addr)
-        
-        # Sprawdź lewego sąsiada
-        if node_idx > 0:
-            left_sibling_addr = parent.children[node_idx - 1]
-            left_sibling = self._read_node(left_sibling_addr)
-            
-            if len(left_sibling.keys) < self.max_keys:
-                # Kompensacja z lewym sąsiadem
-                self._compensate_with_left(node_addr, left_sibling_addr, node.parent_addr, node_idx)
-                return True
-        
-        # Sprawdź prawego sąsiada
-        if node_idx < len(parent.children) - 1:
-            right_sibling_addr = parent.children[node_idx + 1]
-            right_sibling = self._read_node(right_sibling_addr)
-            
-            if len(right_sibling.keys) < self.max_keys:
-                # Kompensacja z prawym sąsiadem
-                self._compensate_with_right(node_addr, right_sibling_addr, node.parent_addr, node_idx)
-                return True
-        
-        return False
-    
-    def _compensate_with_left(self, node_addr, left_addr, parent_addr, node_idx):
-        """Kompensacja z lewym sąsiadem"""
-        node = self._read_node(node_addr)
-        left = self._read_node(left_addr)
-        parent = self._read_node(parent_addr)
-        
-        # Zbierz wszystkie klucze
-        all_keys = left.keys + [parent.keys[node_idx - 1]] + node.keys
-        all_addrs = left.addresses + [None] + node.addresses  # None to separator
-        
-        if not node.is_leaf:
-            all_children = left.children + node.children
-        
-        # Podziel równo
-        mid = len(all_keys) // 2
-        
-        left.keys = all_keys[:mid]
-        left.addresses = all_addrs[:mid]
-        
-        parent.keys[node_idx - 1] = all_keys[mid]
-        
-        node.keys = all_keys[mid + 1:]
-        node.addresses = [a for a in all_addrs[mid + 1:] if a is not None]
-        
-        if not node.is_leaf:
-            left.children = all_children[:mid + 1]
-            node.children = all_children[mid + 1:]
-        
-        self._write_node(left_addr, left)
-        self._write_node(node_addr, node)
-        self._write_node(parent_addr, parent)
-    
-    def _compensate_with_right(self, node_addr, right_addr, parent_addr, node_idx):
-        """Kompensacja z prawym sąsiadem"""
-        node = self._read_node(node_addr)
-        right = self._read_node(right_addr)
-        parent = self._read_node(parent_addr)
-        
-        # Zbierz wszystkie klucze
-        all_keys = node.keys + [parent.keys[node_idx]] + right.keys
-        all_addrs = node.addresses + [None] + right.addresses
-        
-        if not node.is_leaf:
-            all_children = node.children + right.children
-        
-        # Podziel równo
-        mid = len(all_keys) // 2
-        
-        node.keys = all_keys[:mid]
-        node.addresses = all_addrs[:mid]
-        
-        parent.keys[node_idx] = all_keys[mid]
-        
-        right.keys = all_keys[mid + 1:]
-        right.addresses = [a for a in all_addrs[mid + 1:] if a is not None]
-        
-        if not node.is_leaf:
-            node.children = all_children[:mid + 1]
-            right.children = all_children[mid + 1:]
-        
-        self._write_node(node_addr, node)
-        self._write_node(right_addr, right)
-        self._write_node(parent_addr, parent)
-    
-    def _split_node(self, node_addr):
-        """Podziel węzeł"""
-        node = self._read_node(node_addr)
-        
-        mid = len(node.keys) // 2
-        mid_key = node.keys[mid]
-        
-        # Utwórz nowy węzeł
-        new_node = BTreeNode(is_leaf=node.is_leaf)
-        new_node.keys = node.keys[mid + 1:]
-        new_node.addresses = node.addresses[mid + 1:]
-        
-        if not node.is_leaf:
-            new_node.children = node.children[mid + 1:]
-        
-        # Zaktualizuj stary węzeł
-        node.keys = node.keys[:mid]
-        node.addresses = node.addresses[:mid]
-        
-        if not node.is_leaf:
-            node.children = node.children[:mid + 1]
-        
-        new_node_addr = self._get_new_page_addr()
-        self._write_node(new_node_addr, new_node)
-        self._write_node(node_addr, node)
-        
-        # Wstaw środkowy klucz do rodzica
-        if node.parent_addr is None:
-            # Utwórz nowy korzeń
-            new_root = BTreeNode(is_leaf=False)
-            new_root.keys.append(mid_key)
-            new_root.addresses.append(node.addresses[mid])
-            new_root.children.append(node_addr)
-            new_root.children.append(new_node_addr)
-            
-            new_root_addr = self._get_new_page_addr()
-            self.root_addr = new_root_addr
-            
-            node.parent_addr = new_root_addr
-            new_node.parent_addr = new_root_addr
-            
-            self._write_node(new_root_addr, new_root)
-            self._write_node(node_addr, node)
-            self._write_node(new_node_addr, new_node)
-        else:
-            # Wstaw do istniejącego rodzica
-            parent = self._read_node(node.parent_addr)
-            
-            idx = parent.children.index(node_addr)
-            parent.keys.insert(idx, mid_key)
-            parent.addresses.insert(idx, node.addresses[mid])
-            parent.children.insert(idx + 1, new_node_addr)
-            
-            new_node.parent_addr = node.parent_addr
-            
-            self._write_node(node.parent_addr, parent)
-            self._write_node(new_node_addr, new_node)
-            
-            if len(parent.keys) > self.max_keys:
-                self._handle_overflow(node.parent_addr)
-    
-    def delete(self, key):
-        """Usuń rekord po kluczu"""
-        if self.root_addr is None:
-            print(f"Błąd: Drzewo jest puste!")
-            return False
-        
-        result = self._delete_recursive(self.root_addr, key)
-        
-        if result:
-            # Sprawdź czy korzeń jest pusty
-            root = self._read_node(self.root_addr)
-            if len(root.keys) == 0 and not root.is_leaf:
-                old_root_addr = self.root_addr
-                self.root_addr = root.children[0]
-                self._free_page_addr(old_root_addr)
-        
-        return result
-    
-    def _delete_recursive(self, node_addr, key):
-        """Rekurencyjne usuwanie z B-drzewa"""
-        node = self._read_node(node_addr)
-        
-        i = 0
-        while i < len(node.keys) and key > node.keys[i]:
-            i += 1
-        
-        if i < len(node.keys) and key == node.keys[i]:
-            # Znaleziono klucz
-            if node.is_leaf:
-                # Usuń z liścia
-                record_addr = node.addresses[i]
-                self._free_page_addr(record_addr)
-                
-                node.keys.pop(i)
-                node.addresses.pop(i)
-                self._write_node(node_addr, node)
-                
-                # Sprawdź niedopełnienie
-                if node_addr != self.root_addr and len(node.keys) < self.min_keys:
-                    self._handle_underflow(node_addr)
-                
-                return True
-            else:
-                # Zastąp kluczem z poddrzewa
-                # Znajdź największy klucz w lewym poddrzewie
-                pred_key, pred_addr = self._get_predecessor(node.children[i])
-                node.keys[i] = pred_key
-                node.addresses[i] = pred_addr
-                self._write_node(node_addr, node)
-                
-                # Usuń znaleziony klucz z liścia
-                return self._delete_recursive(node.children[i], pred_key)
-        elif not node.is_leaf:
-            # Szukaj w dziecku
-            return self._delete_recursive(node.children[i], key)
-        else:
-            print(f"Błąd: Klucz {key} nie istnieje!")
-            return False
-    
-    def _get_predecessor(self, node_addr):
-        """Znajdź poprzednika (największy klucz w poddrzewie)"""
-        node = self._read_node(node_addr)
-        
-        if node.is_leaf:
-            return node.keys[-1], node.addresses[-1]
-        
-        return self._get_predecessor(node.children[-1])
-    
-    def _handle_underflow(self, node_addr):
-        """Obsłuż niedopełnienie węzła"""
-        node = self._read_node(node_addr)
-        parent = self._read_node(node.parent_addr)
-        
-        node_idx = parent.children.index(node_addr)
-        
-        # Spróbuj kompensacji z sąsiadami
-        if node_idx > 0:
-            left_addr = parent.children[node_idx - 1]
-            left = self._read_node(left_addr)
-            if len(left.keys) > self.min_keys:
-                self._borrow_from_left(node_addr, left_addr, node.parent_addr, node_idx)
-                return
-        
-        if node_idx < len(parent.children) - 1:
-            right_addr = parent.children[node_idx + 1]
-            right = self._read_node(right_addr)
-            if len(right.keys) > self.min_keys:
-                self._borrow_from_right(node_addr, right_addr, node.parent_addr, node_idx)
-                return
-        
-        # Kompensacja niemożliwa - złącz węzły
-        if node_idx > 0:
-            left_addr = parent.children[node_idx - 1]
-            self._merge_nodes(left_addr, node_addr, node.parent_addr, node_idx - 1)
-        else:
-            right_addr = parent.children[node_idx + 1]
-            self._merge_nodes(node_addr, right_addr, node.parent_addr, node_idx)
-    
-    def _borrow_from_left(self, node_addr, left_addr, parent_addr, node_idx):
-        """Pożycz klucz od lewego sąsiada"""
-        node = self._read_node(node_addr)
-        left = self._read_node(left_addr)
-        parent = self._read_node(parent_addr)
-        
-        # Przenieś klucz z rodzica do węzła
-        node.keys.insert(0, parent.keys[node_idx - 1])
-        node.addresses.insert(0, parent.addresses[node_idx - 1])
-        
-        if not node.is_leaf:
-            node.children.insert(0, left.children.pop())
-        
-        # Przenieś klucz z lewego sąsiada do rodzica
-        parent.keys[node_idx - 1] = left.keys.pop()
-        parent.addresses[node_idx - 1] = left.addresses.pop()
-        
-        self._write_node(node_addr, node)
-        self._write_node(left_addr, left)
-        self._write_node(parent_addr, parent)
-    
-    def _borrow_from_right(self, node_addr, right_addr, parent_addr, node_idx):
-        """Pożycz klucz od prawego sąsiada"""
-        node = self._read_node(node_addr)
-        right = self._read_node(right_addr)
-        parent = self._read_node(parent_addr)
-        
-        # Przenieś klucz z rodzica do węzła
-        node.keys.append(parent.keys[node_idx])
-        node.addresses.append(parent.addresses[node_idx])
-        
-        if not node.is_leaf:
-            node.children.append(right.children.pop(0))
-        
-        # Przenieś klucz z prawego sąsiada do rodzica
-        parent.keys[node_idx] = right.keys.pop(0)
-        parent.addresses[node_idx] = right.addresses.pop(0)
-        
-        self._write_node(node_addr, node)
-        self._write_node(right_addr, right)
-        self._write_node(parent_addr, parent)
-    
-    def _merge_nodes(self, left_addr, right_addr, parent_addr, parent_idx):
-        """Złącz dwa węzły"""
-        left = self._read_node(left_addr)
-        right = self._read_node(right_addr)
-        parent = self._read_node(parent_addr)
-        
-        # Przenieś klucz z rodzica
-        left.keys.append(parent.keys[parent_idx])
-        left.addresses.append(parent.addresses[parent_idx])
-        
-        # Przenieś wszystko z prawego węzła
-        left.keys.extend(right.keys)
-        left.addresses.extend(right.addresses)
-        
-        if not left.is_leaf:
-            left.children.extend(right.children)
-        
-        # Usuń klucz z rodzica
-        parent.keys.pop(parent_idx)
-        parent.addresses.pop(parent_idx)
-        parent.children.pop(parent_idx + 1)
-        
-        self._write_node(left_addr, left)
-        self._write_node(parent_addr, parent)
-        self._free_page_addr(right_addr)
-        
-        # Sprawdź niedopełnienie rodzica
-        if parent_addr != self.root_addr and len(parent.keys) < self.min_keys:
-            self._handle_underflow(parent_addr)
-    
+    # --- UPDATE (Dla obsługi skryptu) ---
     def update(self, key, new_numbers):
-        """Aktualizuj rekord"""
-        record = self.search(key)
-        if record is None:
-            print(f"Błąd: Klucz {key} nie istnieje!")
-            return False
-        
-        record.numbers = new_numbers
-        
-        # Znajdź adres rekordu i zaktualizuj
-        node_addr = self.root_addr
-        while node_addr is not None:
-            node = self._read_node(node_addr)
-            
-            i = 0
-            while i < len(node.keys) and key > node.keys[i]:
-                i += 1
-            
-            if i < len(node.keys) and key == node.keys[i]:
-                self._write_record(node.addresses[i], record)
+        rec, node_id, idx = self.search(key)
+        if rec:
+            node = self.get_node(node_id)
+            data_page_id = node.values[idx]
+            try:
+                self.data_mgr.update_record(data_page_id, new_numbers)
+                print(f"Zaktualizowano klucz {key}.")
                 return True
-            
+            except ValueError as e:
+                print(f"Błąd aktualizacji (za dużo danych?): {e}")
+                return False
+        else:
+            print(f"Klucz {key} nie istnieje - brak aktualizacji.")
+            return False
+
+    def _delete_recursive(self, node, node_id, key):
+        idx = 0
+        while idx < len(node.keys) and key > node.keys[idx]:
+            idx += 1
+        
+        if idx < len(node.keys) and node.keys[idx] == key:
             if node.is_leaf:
-                break
+                self.data_mgr.delete_record(node.values[idx])
+                del node.keys[idx]
+                del node.values[idx]
+                self.save_node(node_id, node)
+            else:
+                pred_child_id = node.children[idx]
+                pred_node = self.get_node(pred_child_id)
+                while not pred_node.is_leaf:
+                    pred_child_id = pred_node.children[-1]
+                    pred_node = self.get_node(pred_child_id)
+                
+                predecessor_key = pred_node.keys[-1]
+                predecessor_val = pred_node.values[-1]
+                
+                node.keys[idx] = predecessor_key
+                node.values[idx] = predecessor_val
+                self.save_node(node_id, node)
+                
+                self._delete_recursive(self.get_node(node.children[idx]), node.children[idx], predecessor_key)
+        
+        else:
+            if node.is_leaf: return 
+
+            child_id = node.children[idx]
+            child = self.get_node(child_id)
+
+            if len(child.keys) == self.d: # Warunek minimalnego wypełnienia
+                self._fix_child(node, idx, child, child_id)
+                if idx > len(node.keys): idx -= 1
+                child_id = node.children[idx]
+                child = self.get_node(child_id)
+
+            self._delete_recursive(child, child_id, key)
+
+    def _fix_child(self, parent, idx, child, child_id):
+        if idx > 0:
+            left_sibling_id = parent.children[idx-1]
+            left_sibling = self.get_node(left_sibling_id)
+            if len(left_sibling.keys) > self.d:
+                child.keys.insert(0, parent.keys[idx-1])
+                child.values.insert(0, parent.values[idx-1])
+                if not child.is_leaf:
+                    child.children.insert(0, left_sibling.children.pop())
+                
+                parent.keys[idx-1] = left_sibling.keys.pop()
+                parent.values[idx-1] = left_sibling.values.pop()
+                
+                self.save_node(child_id, child)
+                self.save_node(left_sibling_id, left_sibling)
+                self.save_node(None, parent)
+                return
+
+        if idx < len(parent.children) - 1:
+            right_sibling_id = parent.children[idx+1]
+            right_sibling = self.get_node(right_sibling_id)
+            if len(right_sibling.keys) > self.d:
+                child.keys.append(parent.keys[idx])
+                child.values.append(parent.values[idx])
+                if not child.is_leaf:
+                    child.children.append(right_sibling.children.pop(0))
+                
+                parent.keys[idx] = right_sibling.keys.pop(0)
+                parent.values[idx] = right_sibling.values.pop(0)
+                
+                self.save_node(child_id, child)
+                self.save_node(right_sibling_id, right_sibling)
+                self.save_node(None, parent)
+                return
+
+        if idx > 0:
+            left_sibling_id = parent.children[idx-1]
+            left_sibling = self.get_node(left_sibling_id)
             
-            node_addr = node.children[i]
-        
-        return False
-    
-    def traverse(self):
-        """Przejdź przez całe drzewo w porządku rosnącym"""
-        if self.root_addr is None:
-            return []
-        
-        return self._traverse_recursive(self.root_addr)
-    
-    def _traverse_recursive(self, node_addr):
-        """Rekurencyjne przechodzenie drzewa"""
-        node = self._read_node(node_addr)
-        result = []
-        
-        for i in range(len(node.keys)):
+            left_sibling.keys.append(parent.keys[idx-1])
+            left_sibling.values.append(parent.values[idx-1])
+            left_sibling.keys.extend(child.keys)
+            left_sibling.values.extend(child.values)
+            if not left_sibling.is_leaf:
+                left_sibling.children.extend(child.children)
+            
+            del parent.keys[idx-1]
+            del parent.values[idx-1]
+            del parent.children[idx]
+            
+            self.disk.delete_page(child_id)
+            self.save_node(left_sibling_id, left_sibling)
+            self.save_node(None, parent)
+        else:
+            right_sibling_id = parent.children[idx+1]
+            right_sibling = self.get_node(right_sibling_id)
+            
+            child.keys.append(parent.keys[idx])
+            child.values.append(parent.values[idx])
+            child.keys.extend(right_sibling.keys)
+            child.values.extend(right_sibling.values)
+            if not child.is_leaf:
+                child.children.extend(right_sibling.children)
+                
+            del parent.keys[idx]
+            del parent.values[idx]
+            del parent.children[idx+1]
+            
+            self.disk.delete_page(right_sibling_id)
+            self.save_node(child_id, child)
+            self.save_node(None, parent)
+
+    def print_tree(self):
+        print("\n--- Struktura B-Drzewa ---")
+        if self.root_id is not None:
+            self._print_node(self.root_id, 0)
+        else:
+            print("Drzewo puste.")
+        print("--------------------------\n")
+
+    def _print_node(self, node_id, level):
+        node = self.get_node(node_id)
+        if node:
+            indent = "  " * level
+            print(f"{indent}Strona {node_id}: {node.keys}")
             if not node.is_leaf:
-                result.extend(self._traverse_recursive(node.children[i]))
+                for child_id in node.children:
+                    self._print_node(child_id, level + 1)
+
+# --- NARZĘDZIA POMOCNICZE ---
+
+def clean_files(prefixes):
+    """Usuwa pliki bazy danych przed eksperymentem."""
+    for base in prefixes:
+        # Teraz szukamy głównie .bin
+        filename = base + ".bin"
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+
+def print_data_file(data_mgr):
+    print("\n--- Plik Danych (Rekordy) ---")
+    # Iteracja po stronach w surowym pliku:
+    # Pobieramy max ID z metadanych
+    max_id = data_mgr.disk.get_next_page_id()
+    
+    # Przeglądamy od strony 1 (0 to metadane) do max_id
+    for page_id in range(1, max_id):
+        obj = data_mgr.read_record(page_id)
+        if obj and isinstance(obj, Record):
+            status = "WOLNY" if page_id in data_mgr.free_pages else "ZAJĘTY"
+            print(f"Strona {page_id} [{status}]: {obj}")
             
-            record = self._read_record(node.addresses[i])
-            result.append(record)
-        
-        if not node.is_leaf and node.children:
-            result.extend(self._traverse_recursive(node.children[-1]))
-        
-        return result
-    
-    def display_tree(self):
-        """Wyświetl strukturę drzewa"""
-        if self.root_addr is None:
-            print("Drzewo jest puste")
-            return
-        
-        print(f"\n=== Struktura B-drzewa (d={self.d}) ===")
-        self._display_node(self.root_addr, 0, "ROOT")
-    
-    def _display_node(self, node_addr, level, label):
-        """Wyświetl węzeł drzewa"""
-        node = self._read_node(node_addr)
-        
-        indent = "  " * level
-        node_type = "LEAF" if node.is_leaf else "INTERNAL"
-        print(f"{indent}{label} [Addr={node_addr}, Type={node_type}]:")
-        print(f"{indent}  Keys: {node.keys}")
-        print(f"{indent}  Count: {len(node.keys)}/{self.max_keys}")
-        
-        if not node.is_leaf:
-            for i, child_addr in enumerate(node.children):
-                self._display_node(child_addr, level + 1, f"Child-{i}")
-    
-    def display_data(self):
-        """Wyświetl wszystkie dane w porządku rosnącym"""
-        print("\n=== Zawartość pliku danych ===")
-        records = self.traverse()
-        if not records:
-            print("Brak rekordów")
-            return
-        
-        for record in records:
-            print(f"  {record}")
-        print(f"Łącznie rekordów: {len(records)}")
+    print(f"Lista wolnych stron: {data_mgr.free_pages}")
+    print("-----------------------------")
 
-
-def run_interactive():
-    """Tryb interaktywny"""
-    print("=== System zarządzania B-drzewem ===")
-    print("Wprowadź stopień drzewa (d):")
-    
+def generate_random_records(btree, count):
+    print(f"Generowanie {count} losowych rekordów...")
+    max_range = max(count * 10, 10000)
     try:
-        d = int(input("d = "))
-        if d < 2:
-            print("Stopień musi być >= 2. Ustawiam d=2")
-            d = 2
-    except:
-        print("Błąd! Ustawiam d=2")
-        d = 2
+        keys = random.sample(range(1, max_range), count)
+    except ValueError:
+        keys = random.sample(range(1, count * 2), count)
+
+    added_count = 0
+    stats.reset()
     
-    btree = BTree(d=d)
+    for key in keys:
+        num_count = random.randint(3, 8)
+        numbers = [random.randint(1, 100) for _ in range(num_count)]
+        if btree.insert(key, numbers):
+            added_count += 1
+            
+    print(f"Sukces: Dodano {added_count} nowych rekordów.")
+    print(f"Koszt operacji (IO): {stats}")
+
+def run_script(btree, filename):
+    """
+    Wykonuje komendy z pliku tekstowego.
+    """
+    print(f"--- Uruchamianie skryptu: {filename} ---")
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                parts = line.split()
+                cmd = parts[0].upper()
+                
+                print(f"CMD: {line}")
+                stats.reset()
+                
+                try:
+                    if cmd == "ADD":
+                        key = int(parts[1])
+                        nums = [int(x) for x in parts[2:]]
+                        btree.insert(key, nums)
+                    elif cmd == "DEL":
+                        key = int(parts[1])
+                        btree.delete(key)
+                    elif cmd == "UPD":
+                        key = int(parts[1])
+                        nums = [int(x) for x in parts[2:]]
+                        btree.update(key, nums)
+                    else:
+                        print("Nieznana komenda")
+                    print(f"   -> IO: {stats}")
+                except Exception as e:
+                    print(f"   -> Błąd wykonania linii: {e}")
+                    
+    except FileNotFoundError:
+        print("Nie znaleziono pliku skryptu.")
+
+def run_experiment():
+    print("\n=== ROZPOCZYNANIE EKSPERYMENTU (RAW BINARY) ===")
+    print(f"PAGE_SIZE ustawione na: {PAGE_SIZE} Bajtów")
+    
+    degrees = [2, 5, 10]
+    record_counts = [50, 100, 200, 500]
+    
+    results = {}
+
+    print(f"{'d':<5} | {'N':<5} | {'Avg Read':<10} | {'Avg Write':<10} | {'Idx Size(B)':<12} | {'Dat Size(B)':<12}")
+    print("-" * 75)
+    
+    for d in degrees:
+        results[d] = {
+            'N': [], 'reads': [], 'writes': [], 'idx_size': [], 'dat_size': []
+        }
+        for N in record_counts:
+            # 1. Wyczyść stare pliki
+            clean_files(["exp_index", "exp_data"])
+            
+            # 2. Inicjalizacja (CustomDiskManager)
+            disk_idx = DiskManager("exp_index")
+            disk_dat = DiskManager("exp_data")
+            mgr = DataFileManager(disk_dat)
+            btree = BTree(d, disk_idx, mgr)
+            
+            # 3. Wykonanie operacji
+            keys = list(range(1, N + 1))
+            random.shuffle(keys)
+            
+            stats.reset()
+            for k in keys:
+                nums = [random.randint(1, 100) for _ in range(3)]
+                btree.insert(k, nums)
+            
+            # 4. Zbieranie metryk
+            avg_r = stats.reads / N
+            avg_w = stats.writes / N
+            idx_size = disk_idx.get_file_size()
+            dat_size = disk_dat.get_file_size()
+            
+            results[d]['N'].append(N)
+            results[d]['reads'].append(avg_r)
+            results[d]['writes'].append(avg_w)
+            results[d]['idx_size'].append(idx_size)
+            results[d]['dat_size'].append(dat_size)
+            
+            print(f"{d:<5} | {N:<5} | {avg_r:<10.2f} | {avg_w:<10.2f} | {idx_size:<12} | {dat_size:<12}")
+            
+            # Zamknięcie deskryptorów
+            disk_idx.close()
+            disk_dat.close()
+
+    generate_plots(results)
+
+def generate_plots(results):
+    # Wykres 1: Odczyty vs N
+    plt.figure(figsize=(10, 5))
+    for d, data in results.items():
+        plt.plot(data['N'], data['reads'], marker='o', label=f'd={d}')
+    plt.title(f'Średnia liczba odczytów vs N (Page={PAGE_SIZE}B)')
+    plt.xlabel('Liczba rekordów (N)')
+    plt.ylabel('Średnie odczyty dyskowe')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('wykres_odczyty.png')
+    print("\nWygenerowano wykres: wykres_odczyty.png")
+
+    # Wykres 2: Rozmiar Indeksu vs N
+    plt.figure(figsize=(10, 5))
+    for d, data in results.items():
+        plt.plot(data['N'], data['idx_size'], marker='s', linestyle='--', label=f'd={d}')
+    plt.title(f'Rozmiar pliku indeksu vs N (Page={PAGE_SIZE}B)')
+    plt.xlabel('Liczba rekordów (N)')
+    plt.ylabel('Rozmiar pliku (Bajty)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('wykres_rozmiar.png')
+    print("Wygenerowano wykres: wykres_rozmiar.png")
+
+def interactive_mode():
+    idx_filename = "main_index"
+    dat_filename = "main_data"
+    
+    idx_disk = DiskManager(idx_filename)
+    dat_disk = DiskManager(dat_filename)
+    data_mgr = DataFileManager(dat_disk)
+    
+    btree = BTree(2, idx_disk, data_mgr)
+
+    print("System B-Drzewa (Zadanie 2) - BINARY MODE.")
+    print(f"Pliki bazy danych: {idx_filename}.bin, {dat_filename}.bin")
+    print("Wpisz 'help' aby zobaczyć listę komend.")
     
     while True:
-        print("\n=== MENU ===")
-        print("1. Wstaw rekord")
-        print("2. Wyszukaj rekord")
-        print("3. Usuń rekord")
-        print("4. Aktualizuj rekord")
-        print("5. Wyświetl wszystkie rekordy")
-        print("6. Wyświetl strukturę drzewa")
-        print("7. Wczytaj plik testowy")
-        print("8. Przeprowadź eksperyment")
-        print("9. Wyjście")
-        
-        choice = input("\nWybór: ").strip()
-        
-        if choice == '1':
-            try:
-                key = int(input("Klucz: "))
-                numbers_str = input("Liczby (oddzielone spacją): ")
-                numbers = [int(x) for x in numbers_str.split()]
+        try:
+            cmd_input = input("> ").strip()
+            if not cmd_input: continue
+            
+            cmd_parts = cmd_input.split()
+            op = cmd_parts[0].lower()
+            
+            if op == "exit":
+                idx_disk.close()
+                dat_disk.close()
+                break
                 
-                stats.reset()
-                record = Record(key, numbers)
-                if btree.insert(record):
-                    print(f"✓ Rekord wstawiony. {stats}")
-                    btree.display_tree()
-            except Exception as e:
-                print(f"Błąd: {e}")
-        
-        elif choice == '2':
-            try:
-                key = int(input("Klucz: "))
-                stats.reset()
-                record = btree.search(key)
-                if record:
-                    print(f"✓ Znaleziono: {record}")
-                else:
-                    print("✗ Nie znaleziono")
-                print(stats)
-            except Exception as e:
-                print(f"Błąd: {e}")
-        
-        elif choice == '3':
-            try:
-                key = int(input("Klucz: "))
-                stats.reset()
-                if btree.delete(key):
-                    print(f"✓ Rekord usunięty. {stats}")
-                    btree.display_tree()
-            except Exception as e:
-                print(f"Błąd: {e}")
-        
-        elif choice == '4':
-            try:
-                key = int(input("Klucz: "))
-                numbers_str = input("Nowe liczby (oddzielone spacją): ")
-                numbers = [int(x) for x in numbers_str.split()]
-                
-                stats.reset()
-                if btree.update(key, numbers):
-                    print(f"✓ Rekord zaktualizowany. {stats}")
-            except Exception as e:
-                print(f"Błąd: {e}")
-                
-        elif choice == '5':
-            # Wyświetl wszystkie rekordy
-            try:
-                stats.reset()
-                btree.display_data()
-                print(stats)
-            except Exception as e:
-                print(f"Błąd: {e}")
-
-        elif choice == '6':
-            # Wyświetl strukturę drzewa
-            try:
-                btree.display_tree()
-            except Exception as e:
-                print(f"Błąd: {e}")
-
-        elif choice == '7':
-            # Wczytaj plik testowy (format: key num1 num2 ... per line)
-            try:
-                path = input("Ścieżka do pliku testowego (domyślnie 'test.txt'): ").strip()
-                if not path:
-                    path = 'test.txt'
-                if not os.path.exists(path):
-                    print(f"Plik {path} nie istnieje")
+            elif op == "add": 
+                if len(cmd_parts) < 3:
+                    print("Użycie: add <key> <n1> <n2> ...")
                     continue
+                try:
+                    key = int(cmd_parts[1])
+                    nums = [int(x) for x in cmd_parts[2:]]
+                    stats.reset()
+                    btree.insert(key, nums)
+                    print(f"IO: {stats}")
+                except ValueError as e:
+                    print(f"Błąd: {e}")
 
-                inserted = 0
-                stats.reset()
-                with open(path, 'r', encoding='utf-8') as tf:
-                    for line in tf:
-                        line = line.strip()
-                        if not line or line.startswith('#'):
-                            continue
-                        parts = line.split()
-                        try:
-                            key = int(parts[0])
-                            numbers = [int(x) for x in parts[1:]]
-                        except Exception:
-                            print(f"Niepoprawny wiersz: {line}")
-                            continue
+            elif op == "upd":
+                if len(cmd_parts) < 3:
+                    print("Użycie: upd <key> <n1> <n2> ...")
+                    continue
+                try:
+                    key = int(cmd_parts[1])
+                    nums = [int(x) for x in cmd_parts[2:]]
+                    stats.reset()
+                    btree.update(key, nums)
+                    print(f"IO: {stats}")
+                except ValueError as e:
+                    print(f"Błąd: {e}")
+                
+            elif op == "find":
+                if len(cmd_parts) < 2: continue
+                try:
+                    key = int(cmd_parts[1])
+                    stats.reset()
+                    rec, node_id, idx = btree.search(key)
+                    if rec:
+                        print(f"Znaleziono: {rec} (Node: {node_id}, Index: {idx})")
+                    else:
+                        print("Nie znaleziono.")
+                    print(f"IO: {stats}")
+                except ValueError:
+                    print("Błąd: Klucz musi być liczbą całkowitą.")
+                
+            elif op == "del":
+                if len(cmd_parts) < 2: continue
+                try:
+                    key = int(cmd_parts[1])
+                    stats.reset()
+                    btree.delete(key)
+                    print(f"IO: {stats}")
+                except ValueError:
+                    print("Błąd: Klucz musi być liczbą całkowitą.")
 
-                        rec = Record(key, numbers)
-                        if btree.insert(rec):
-                            inserted += 1
+            elif op == "print":
+                btree.print_tree()
+                print_data_file(data_mgr)
+                print(f"Rozmiar pliku indeksu: {idx_disk.get_file_size()} B")
+                print(f"Rozmiar pliku danych: {dat_disk.get_file_size()} B")
 
-                print(f"Wczytano rekordów: {inserted}. {stats}")
-                btree.display_tree()
-            except Exception as e:
-                print(f"Błąd: {e}")
+            elif op == "script":
+                if len(cmd_parts) < 2: 
+                    print("Podaj nazwę pliku.")
+                    continue
+                run_script(btree, cmd_parts[1])
 
-        elif choice == '8':
-            # Przeprowadź eksperyment - seria losowych operacji na nowym drzewie
-            try:
-                n = int(input("Ile rekordów wstawić? (np. 100): ").strip() or "100")
-                max_val = int(input("Maksymalny klucz (np. 10000): ").strip() or "10000")
-                numbers_per_record = int(input("Ile liczb w rekordzie? (np. 5): ").strip() or "5")
+            elif op == "exp":
+                run_experiment()
+            
+            elif op == "random":
+                if len(cmd_parts) < 2: continue
+                try:
+                    generate_random_records(btree, int(cmd_parts[1]))
+                except ValueError:
+                    print("Podaj poprawną liczbę.")
+                
+            elif op == "clear":
+                idx_disk.clear()
+                dat_disk.clear()
+                btree = BTree(2, idx_disk, data_mgr)
+                print("Baza wyczyszczona.")
 
-                # Użyj tymczasowych plików by nie kolidować z aktualnym drzewem
-                exp_filename = f"btree_exp_{random.randint(1,1000000)}.db"
-                exp_tree = BTree(filename=exp_filename, d=btree.d)
-                keys = []
+            elif op == "help":
+                print("Komendy:")
+                print("  add <id> <n1>...  - dodaj nowy rekord")
+                print("  upd <id> <n1>...  - aktualizuj rekord")
+                print("  del <id>          - usuń rekord")
+                print("  find <id>         - szukaj rekordu")
+                print("  script <file>     - wykonaj skrypt")
+                print("  print             - pokaż strukturę i rozmiar")
+                print("  exp               - eksperyment z wykresami")
+                print("  random <n>        - generuj n rekordów")
+                print("  clear             - wyczyść bazę")
+                print("  exit              - wyjście")
+            else:
+                print("Nieznana komenda.")
+                
+        except Exception as e:
+            print(f"Błąd krytyczny pętli: {e}")
 
-                # Wstawianie
-                stats.reset()
-                for i in range(n):
-                    # losowy unikalny klucz
-                    while True:
-                        k = random.randint(1, max_val)
-                        if k not in keys:
-                            break
-                    keys.append(k)
-                    nums = [random.randint(0, 100) for _ in range(numbers_per_record)]
-                    exp_tree.insert(Record(k, nums))
-
-                inserted = len(keys)
-                print(f"Wstawiono {inserted} rekordów. {stats}")
-
-                # Wyszukiwanie - losowe 20% z wstawionych + kilka nieistniejących
-                stats.reset()
-                searches = 0
-                for _ in range(max(1, inserted // 5)):
-                    k = random.choice(keys)
-                    _ = exp_tree.search(k)
-                    searches += 1
-                for _ in range(max(1, inserted // 10)):
-                    _ = exp_tree.search(max_val + random.randint(1, 1000))
-                    searches += 1
-                print(f"Przeprowadzono {searches} wyszukiwań. {stats}")
-
-                # Aktualizacje - zmień kilka rekordów
-                stats.reset()
-                updates = 0
-                for _ in range(max(1, inserted // 10)):
-                    k = random.choice(keys)
-                    nums = [random.randint(0, 100) for _ in range(numbers_per_record)]
-                    if exp_tree.update(k, nums):
-                        updates += 1
-                print(f"Przeprowadzono {updates} aktualizacji. {stats}")
-
-                # Usuwanie - usuń kilka rekordów
-                stats.reset()
-                deletes = 0
-                for _ in range(max(1, inserted // 10)):
-                    if not keys:
-                        break
-                    k = keys.pop(random.randrange(len(keys)))
-                    if exp_tree.delete(k):
-                        deletes += 1
-                print(f"Przeprowadzono {deletes} usunięć. {stats}")
-
-                print("Eksperyment zakończony. Struktura drzewa eksperymentalnego:")
-                exp_tree.display_tree()
-            except Exception as e:
-                print(f"Błąd: {e}")
-
-        elif choice == '9':
-            print("Koniec programu. Zapisuję stan i wychodzę...")
-            break
-        else:
-            print("Nieprawidłowy wybór. Spróbuj ponownie.")
-
-    # Koniec pętli interactive
-
-if __name__ == '__main__':
-    run_interactive()
+if __name__ == "__main__":
+    interactive_mode()

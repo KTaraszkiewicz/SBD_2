@@ -1,0 +1,36 @@
+# --- PLIK TESTOWY B-DRZEWA ---
+# Format: KOMENDA ID DANE...
+
+# 1. Wstawianie początkowe (wymusi splity przy małym d=2)
+ADD 10 5 5 5
+ADD 20 1 2 3
+ADD 5 10 20
+ADD 15 7 7 7
+ADD 30 100 200
+ADD 25 1 1
+ADD 3 50 50
+ADD 12 4 4 4
+ADD 8 2 2
+
+# 2. Test błędów - dodanie duplikatu (powinien odrzucić)
+ADD 10 999 999
+
+# 3. Aktualizacja danych (UPD)
+# Zmieniamy liczby dla klucza 20
+UPD 20 88 88 88
+# Zmieniamy liczby dla klucza 5
+UPD 5 1 1 1
+# Próba aktualizacji nieistniejącego klucza (powinien zgłosić błąd)
+UPD 999 0 0 0
+
+# 4. Usuwanie rekordów (DEL)
+# Usuwanie liści i węzłów wewnętrznych (wymusi merge/kompensację)
+DEL 3
+DEL 15
+DEL 30
+# Próba usunięcia nieistniejącego klucza
+DEL 999
+
+# 5. Sprawdzenie stanu po czyszczeniu - dodanie nowych
+ADD 40 9 9 9
+ADD 35 6 6
