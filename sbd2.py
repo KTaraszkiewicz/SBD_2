@@ -311,8 +311,10 @@ class BTree:
             return False
 
         root = self.get_node(self.root_id)
+        # Przekazujemy ID korzenia do rekurencji
         self._delete_recursive(root, self.root_id, key)
 
+        # Sprawdzenie czy korzeń nie opustoszał (skrócenie drzewa)
         if len(root.keys) == 0 and not root.is_leaf:
             self.disk.delete_page(self.root_id)
             self.update_root(root.children[0])
@@ -346,6 +348,7 @@ class BTree:
                 del node.values[idx]
                 self.save_node(node_id, node)
             else:
+                # Zamiana z poprzednikiem
                 pred_child_id = node.children[idx]
                 pred_node = self.get_node(pred_child_id)
                 while not pred_node.is_leaf:
@@ -358,20 +361,31 @@ class BTree:
                 node.keys[idx] = predecessor_key
                 node.values[idx] = predecessor_val
                 self.save_node(node_id, node)
+                # Rekurencyjne usuwanie poprzednika
                 self._delete_recursive(self.get_node(node.children[idx]), node.children[idx], predecessor_key)
         else:
-            if node.is_leaf: return
+            if node.is_leaf:
+                return
+
             child_id = node.children[idx]
             child = self.get_node(child_id)
+
+            # Proaktywna naprawa (jeśli dziecko ma minimum kluczy)
             if len(child.keys) == self.d:
-                self._fix_child(node, idx, child, child_id)
-                if idx > len(node.keys): idx -= 1
+                # !!! POPRAWKA: Przekazujemy node_id (ID rodzica) !!!
+                self._fix_child(node, node_id, idx, child, child_id)
+
+                # Po naprawie (szczególnie po scalaniu) indeksy mogły się przesunąć
+                if idx > len(node.keys):
+                    idx -= 1
+
                 child_id = node.children[idx]
                 child = self.get_node(child_id)
+
             self._delete_recursive(child, child_id, key)
 
-    def _fix_child(self, parent, idx, child, child_id):
-        # (Logika pożyczania i łączenia węzłów bez zmian - zgodna z teorią)
+    def _fix_child(self, parent, parent_id, idx, child, child_id):
+        # 1. Pożycz od LEWEGO rodzeństwa
         if idx > 0:
             left_sibling_id = parent.children[idx - 1]
             left_sibling = self.get_node(left_sibling_id)
@@ -380,13 +394,17 @@ class BTree:
                 child.values.insert(0, parent.values[idx - 1])
                 if not child.is_leaf:
                     child.children.insert(0, left_sibling.children.pop())
+
                 parent.keys[idx - 1] = left_sibling.keys.pop()
                 parent.values[idx - 1] = left_sibling.values.pop()
+
                 self.save_node(child_id, child)
                 self.save_node(left_sibling_id, left_sibling)
-                self.save_node(None, parent)
+                # !!! POPRAWKA: Używamy parent_id zamiast None !!!
+                self.save_node(parent_id, parent)
                 return
 
+        # 2. Pożycz od PRAWEGO rodzeństwa
         if idx < len(parent.children) - 1:
             right_sibling_id = parent.children[idx + 1]
             right_sibling = self.get_node(right_sibling_id)
@@ -395,48 +413,59 @@ class BTree:
                 child.values.append(parent.values[idx])
                 if not child.is_leaf:
                     child.children.append(right_sibling.children.pop(0))
+
                 parent.keys[idx] = right_sibling.keys.pop(0)
                 parent.values[idx] = right_sibling.values.pop(0)
+
                 self.save_node(child_id, child)
                 self.save_node(right_sibling_id, right_sibling)
-                self.save_node(None, parent)
+                # !!! POPRAWKA: Używamy parent_id zamiast None !!!
+                self.save_node(parent_id, parent)
                 return
 
-        # Merge
+        # 3. Scalanie (Merge)
         if idx > 0:
+            # Scal z lewym
             left_sibling_id = parent.children[idx - 1]
             left_sibling = self.get_node(left_sibling_id)
+
             left_sibling.keys.append(parent.keys[idx - 1])
             left_sibling.values.append(parent.values[idx - 1])
             left_sibling.keys.extend(child.keys)
             left_sibling.values.extend(child.values)
             if not left_sibling.is_leaf:
                 left_sibling.children.extend(child.children)
+
             del parent.keys[idx - 1]
             del parent.values[idx - 1]
             del parent.children[idx]
+
             self.disk.delete_page(child_id)
             self.save_node(left_sibling_id, left_sibling)
-            self.save_node(None, parent)
+            # !!! POPRAWKA: Używamy parent_id !!!
+            self.save_node(parent_id, parent)
         else:
+            # Scal z prawym
             right_sibling_id = parent.children[idx + 1]
             right_sibling = self.get_node(right_sibling_id)
+
             child.keys.append(parent.keys[idx])
             child.values.append(parent.values[idx])
             child.keys.extend(right_sibling.keys)
             child.values.extend(right_sibling.values)
             if not child.is_leaf:
                 child.children.extend(right_sibling.children)
+
             del parent.keys[idx]
             del parent.values[idx]
             del parent.children[idx + 1]
+
             self.disk.delete_page(right_sibling_id)
             self.save_node(child_id, child)
-            self.save_node(None, parent)
+            self.save_node(parent_id, parent)
 
-    # --- NOWA FUNKCJONALNOŚĆ (SCAN) ---
+    # --- POZOSTAŁE METODY ---
     def print_ordered_records(self):
-        """Przechodzi drzewo In-Order i wyświetla rekordy zgodnie z kluczami."""
         print("\n=== Sekwencyjny odczyt bazy (wg klucza) ===")
         if self.root_id is not None:
             self._traverse_and_print(self.root_id)
@@ -449,24 +478,16 @@ class BTree:
         if not node: return
 
         for i in range(len(node.keys)):
-            # Rekurencyjnie odwiedź lewe poddrzewo (jeśli istnieje)
             if not node.is_leaf:
                 self._traverse_and_print(node.children[i])
-
-            # Przetwórz bieżący klucz
             key = node.keys[i]
             record_addr = node.values[i]
-
-            # Pobierz rzeczywisty rekord z pliku danych (symulacja IO)
             record = self.data_mgr.read_record(record_addr)
-
             print(f"Klucz: {key:<6} -> {record}")
 
-        # Odwiedź skrajnie prawe dziecko
         if not node.is_leaf:
             self._traverse_and_print(node.children[-1])
 
-    # --- DEBUGOWANIE STRUKTURY ---
     def print_tree(self):
         print("\n--- Struktura B-Drzewa (Strony) ---")
         if self.root_id is not None:
