@@ -7,11 +7,11 @@ import struct
 import matplotlib.pyplot as plt
 
 # --- KONFIGURACJA SYMULACJI ---
-PAGE_SIZE = 512  # Stały rozmiar strony w bajtach
+PAGE_SIZE = 512  # Stały rozmiar strony w bajtach. To kluczowe, bo symulujemy blokowy zapis na dysk.
 
 
 class DiskStats:
-    """Klasa pomocnicza do zliczania operacji dyskowych."""
+    """Klasa pomocnicza do zliczania operacji dyskowych (statystyki IO)."""
 
     def __init__(self):
         self.reads = 0
@@ -31,17 +31,19 @@ stats = DiskStats()
 
 class DiskManager:
     """
-    Symuluje dysk twardy na surowym pliku binarnym.
-    Plik jest podzielony na bloki o stałej wielkości (PAGE_SIZE).
+    Symuluje fizyczny dysk twardy. Zamiast bazy SQL, używamy surowego pliku binarnego.
+    Dzielimy plik na bloki o wielkości PAGE_SIZE.
     """
 
     def __init__(self, filename):
         self.filename = filename + ".bin"
         self.page_size = PAGE_SIZE
 
+        # Jeśli plik nie istnieje, tworzymy go i inicjalizujemy "Superblock" (strona 0).
+        # Strona 0 trzyma metadane: ID następnej wolnej strony i ID korzenia drzewa.
         if not os.path.exists(self.filename):
             with open(self.filename, 'wb') as f:
-                # Format: [Next_Page_ID (4B int)] [Root_ID (4B int)] [Padding...]
+                # Format: [Next_Page_ID (4B)] [Root_ID (4B)] [Reszta to zera...]
                 f.write(struct.pack('ii', 1, -1))
                 f.write(b'\x00' * (self.page_size - 8))
 
@@ -69,9 +71,11 @@ class DiskManager:
         return next_id
 
     def read_page(self, page_id):
+        """Odczytuje konkretną stronę z dysku i zamienia bajty na obiekt (deserializacja)."""
         if page_id is None: return None
         stats.reads += 1
 
+        # Skaczemy w pliku do odpowiedniego miejsca: numer_strony * wielkość_strony
         offset = page_id * self.page_size
         self.file.seek(offset)
         raw_data = self.file.read(self.page_size)
@@ -85,19 +89,24 @@ class DiskManager:
             return None
 
     def write_page(self, page_id, data_obj):
+        """Zapisuje obiekt na dysku. Symuluje zapis blokowy."""
         stats.writes += 1
         next_id, root_id = self._read_metadata()
 
+        # Jeśli nie podano ID, przydzielamy nową stronę na końcu pliku
         if page_id is None:
             page_id = next_id
             next_id += 1
             self._write_metadata(next_id, root_id)
 
+        # Serializacja: Obiekt -> Bajty
         serialized_data = pickle.dumps(data_obj)
 
+        # Sprawdzenie czy dane zmieszczą się na stronie. To kluczowe ograniczenie B-drzewa.
         if len(serialized_data) > self.page_size:
             raise ValueError(f"CRITICAL: Obiekt za duży ({len(serialized_data)} B) dla strony ({self.page_size} B).")
 
+        # Padding: Dopełniamy zerami, żeby zawsze zapisać dokładnie 512 bajtów (lub inny PAGE_SIZE)
         padding = b'\x00' * (self.page_size - len(serialized_data))
         final_block = serialized_data + padding
 
@@ -108,6 +117,7 @@ class DiskManager:
         return page_id
 
     def delete_page(self, page_id):
+        # Fizyczne usunięcie to po prostu zamazanie zerami
         offset = page_id * self.page_size
         self.file.seek(offset)
         self.file.write(b'\x00' * self.page_size)
@@ -130,6 +140,7 @@ class DiskManager:
 
 
 class Record:
+    """Struktura danych przechowywana w pliku danych (main_data)."""
     def __init__(self, key, numbers):
         self.key = key
         self.numbers = numbers
@@ -141,20 +152,22 @@ class Record:
 
 
 class BTreeNode:
+    """Struktura węzła B-drzewa (strony indeksu)."""
     def __init__(self, is_leaf=False):
         self.is_leaf = is_leaf
         self.keys = []
-        self.values = []
-        self.children = []
+        self.values = []    # Adresy do pliku danych (dla liści) lub do poddrzew (dla węzłów wewn. - zależnie od implementacji)
+        self.children = []  # ID stron dzieci w pliku indeksu
 
     def __repr__(self):
         return f"Node(Leaf={self.is_leaf}, Keys={self.keys})"
 
 
 class DataFileManager:
+    """Zarządza plikiem z rekordami. Oddziela dane od indeksu."""
     def __init__(self, disk):
         self.disk = disk
-        self.free_pages = []
+        self.free_pages = [] # Prosta lista wolnych stron (Recycling)
 
     def insert_record(self, record):
         page_id = None
@@ -189,6 +202,7 @@ class BTree:
         self.data_mgr = data_manager
         self.root_id = self.disk.get_root_id()
 
+        # Jeśli drzewo nie istnieje, tworzymy pusty korzeń (który jest liściem)
         if self.root_id is None:
             root = BTreeNode(is_leaf=True)
             self.root_id = self.disk.write_page(None, root)
@@ -210,26 +224,31 @@ class BTree:
         node = self.get_node(node_id)
         if node is None: return None, None, None
 
+        # Proste przeszukiwanie liniowe wewnątrz węzła (można by użyć bisekcji)
         i = 0
         while i < len(node.keys) and key > node.keys[i]:
             i += 1
 
+        # Jeśli znaleziono klucz
         if i < len(node.keys) and key == node.keys[i]:
             return self.data_mgr.read_record(node.values[i]), node_id, i
 
+        # Jeśli nie ma klucza i to liść -> nie znaleziono
         if node.is_leaf:
             return None, None, None
 
+        # Schodzimy do odpowiedniego dziecka
         return self.search(key, node.children[i])
 
-    # --- WSTAWIANIE ZGODNE Z WYKŁADEM (BOTTOM-UP z KOMPENSACJĄ) ---
+    # --- WSTAWIANIE (BOTTOM-UP z KOMPENSACJĄ) ---
+    # Zgodnie z wykładem: Wstaw do liścia -> Sprawdź przepełnienie -> Kompensuj -> Jak się nie da, to Split -> W górę
     def insert(self, key, numbers):
         # 1. Sprawdź duplikat
         rec, _, _ = self.search(key)
         if rec:
             return False
 
-        # 2. Zapisz dane
+        # 2. Zapisz dane fizycznie w pliku danych
         new_record = Record(key, numbers)
         try:
             data_addr = self.data_mgr.insert_record(new_record)
@@ -237,7 +256,8 @@ class BTree:
             print(f"Błąd zapisu rekordu: {e}")
             return False
 
-        # 3. Znajdź liść i ścieżkę do niego
+        # 3. Znajdź liść, do którego powinien trafić klucz.
+        # Musimy zapamiętać ścieżkę (path), żeby potem móc wracać w górę (Bottom-Up).
         path = self._get_path_to_leaf(self.root_id, key)
         if not path:
             return False
@@ -245,20 +265,23 @@ class BTree:
         leaf_id = path[-1]
         leaf = self.get_node(leaf_id)
 
-        # 4. Wstaw posortowane do liścia
+        # 4. Wstaw klucz do liścia (w pamięci RAM), dbając o sortowanie.
+        # Na tym etapie ignorujemy limit 2d, po prostu wpychamy dane.
         self._insert_to_node_local(leaf, key, data_addr, None)
         self.save_node(leaf_id, leaf)
 
-        # 5. Obsługa przepełnienia (Overflow) w górę drzewa
+        # 5. Pętla naprawcza (idziemy w górę drzewa)
+        # Sprawdzamy, czy węzeł nie "pękł w szwach" (Overflow: len > 2d)
         curr_id = leaf_id
         curr_node = leaf
         
-        # Bezpieczne usunięcie liścia ze ścieżki
+        # Zdejmujemy liść ze stosu ścieżki, bo już go mamy w curr_node
         if path:
             path.pop() 
         
         while len(curr_node.keys) > 2 * self.d:
-            # Jeśli to korzeń (ścieżka pusta), musimy go podzielić
+            # PRZYPADEK SPECJALNY: Przepełniony korzeń.
+            # Musimy stworzyć nowy korzeń i podzielić stary. Drzewo rośnie w górę.
             if not path:
                 new_root = BTreeNode(is_leaf=False)
                 new_root.children.append(curr_id)
@@ -267,29 +290,32 @@ class BTree:
                 self.update_root(new_root_id)
                 return True
             
+            # Pobieramy rodzica ze ścieżki
             parent_id = path[-1]
             parent = self.get_node(parent_id)
             
-            # Znajdź indeks u rodzica
+            # Szukamy, którym dzieckiem rodzica jest nasz bieżący węzeł
             idx_in_parent = -1
             for i, child_id in enumerate(parent.children):
                 if child_id == curr_id:
                     idx_in_parent = i
                     break
             
-            # Kompensacja
+            # --- PRÓBA KOMPENSACJI (Redystrybucja) ---
+            # Zanim podzielimy węzeł, sprawdzamy czy sąsiad nie ma wolnego miejsca.
             compensated = False
             if idx_in_parent != -1:
-                # Sprawdź lewego sąsiada
+                # 1. Sprawdź lewego sąsiada
                 if idx_in_parent > 0:
                     left_sib_id = parent.children[idx_in_parent - 1]
                     left_sib = self.get_node(left_sib_id)
+                    # Jeśli sąsiad ma miejsce (< 2d), oddajemy mu nadmiar
                     if len(left_sib.keys) < 2 * self.d:
                         self._compensate_left(left_sib, left_sib_id, parent, curr_node, curr_id, idx_in_parent - 1)
                         self.save_node(parent_id, parent)
                         compensated = True
                 
-                # Sprawdź prawego sąsiada
+                # 2. Sprawdź prawego sąsiada (jeśli lewy był pełny)
                 if not compensated and idx_in_parent < len(parent.children) - 1:
                     right_sib_id = parent.children[idx_in_parent + 1]
                     right_sib = self.get_node(right_sib_id)
@@ -299,23 +325,25 @@ class BTree:
                         compensated = True
             
             if compensated:
-                return True 
+                return True # Udało się upchnąć u sąsiada, koniec naprawiania.
                 
-            # --- SPLIT ---
+            # --- SPLIT (PODZIAŁ) ---
+            # Sąsiedzi są pełni. Musimy rozciąć węzeł na dwa i wypchnąć środkowy klucz do rodzica.
             target_idx = idx_in_parent if idx_in_parent != -1 else 0
             self._split_child_manual(parent, target_idx, curr_node, curr_id)
             self.save_node(parent_id, parent)
             
+            # Przesuwamy się w górę: teraz to rodzic może być przepełniony (bo dostał klucz).
             curr_id = parent_id
             curr_node = parent
             
-            # Bezpieczne przejście w górę
             if path:
                 path.pop()
 
         return True
 
     def _get_path_to_leaf(self, node_id, key):
+        """Pomocnicza: Buduje stos (ścieżkę) od korzenia do liścia."""
         path = []
         curr = node_id
         while True:
@@ -327,6 +355,7 @@ class BTree:
             i = 0
             while i < len(node.keys) and key > node.keys[i]:
                 i += 1
+            # Zabezpieczenie przed wyjściem poza tablicę children
             if i >= len(node.children):
                 curr = node.children[-1]
             else:
@@ -334,12 +363,14 @@ class BTree:
         return path
 
     def _insert_to_node_local(self, node, key, val, child_right_id):
+        """Wstawia klucz lokalnie do węzła, przesuwając inne elementy."""
         i = len(node.keys) - 1
-        node.keys.append(0)
-        node.values.append(0)
+        node.keys.append(0)   # Placeholder
+        node.values.append(0) # Placeholder
         if not node.is_leaf and child_right_id is not None:
              node.children.append(None)
 
+        # Przesuwanie elementów, by zrobić miejsce
         while i >= 0 and key < node.keys[i]:
             node.keys[i+1] = node.keys[i]
             node.values[i+1] = node.values[i]
@@ -347,23 +378,28 @@ class BTree:
                 node.children[i+2] = node.children[i+1]
             i -= 1
         
+        # Wstawienie na właściwą pozycję
         node.keys[i+1] = key
         node.values[i+1] = val
         if not node.is_leaf and child_right_id is not None:
             node.children[i+2] = child_right_id
 
     def _split_child_manual(self, parent, index, child, child_id):
+        """Realizuje podział węzła (Split). Środek idzie do rodzica."""
         mid_idx = self.d
         mid_key = child.keys[mid_idx]
         mid_val = child.values[mid_idx]
         
+        # Tworzymy nowy węzeł (prawy brat)
         new_node = BTreeNode(is_leaf=child.is_leaf)
         
+        # Przenosimy prawą połowę kluczy do nowego węzła
         new_node.keys = child.keys[mid_idx+1:]
         new_node.values = child.values[mid_idx+1:]
         if not child.is_leaf:
             new_node.children = child.children[mid_idx+1:]
             
+        # Lewa połowa zostaje w starym węźle
         child.keys = child.keys[:mid_idx]
         child.values = child.values[:mid_idx]
         if not child.is_leaf:
@@ -372,18 +408,21 @@ class BTree:
         new_node_id = self.disk.write_page(None, new_node)
         self.save_node(child_id, child)
         
+        # Wstawiamy środkowy klucz i wskaźnik do nowego węzła do RODZICA
         parent.keys.insert(index, mid_key)
         parent.values.insert(index, mid_val)
         parent.children.insert(index + 1, new_node_id)
 
     def _compensate_right(self, left, left_id, parent, right, right_id, separator_idx):
-        """Przenosi klucz z Lewego do Prawego (Source=Left, Target=Right)."""
+        """Rotacja w prawo: Lewy -> Rodzic -> Prawy"""
+        # Separator z rodzica idzie do prawego
         right.keys.insert(0, parent.keys[separator_idx])
         right.values.insert(0, parent.values[separator_idx])
         
         if not right.is_leaf and left.children:
             right.children.insert(0, left.children.pop())
             
+        # Ostatni z lewego idzie do rodzica (staje się nowym separatorem)
         parent.keys[separator_idx] = left.keys.pop()
         parent.values[separator_idx] = left.values.pop()
         
@@ -391,13 +430,15 @@ class BTree:
         self.save_node(right_id, right)
         
     def _compensate_left(self, left, left_id, parent, right, right_id, separator_idx):
-        """Przenosi klucz z Prawego do Lewego (Source=Right, Target=Left)."""
+        """Rotacja w lewo: Prawy -> Rodzic -> Lewy"""
+        # Separator z rodzica idzie do lewego
         left.keys.append(parent.keys[separator_idx])
         left.values.append(parent.values[separator_idx])
         
         if not left.is_leaf and right.children:
             left.children.append(right.children.pop(0))
             
+        # Pierwszy z prawego idzie do rodzica
         parent.keys[separator_idx] = right.keys.pop(0)
         parent.values[separator_idx] = right.values.pop(0)
         
@@ -405,8 +446,9 @@ class BTree:
         self.save_node(right_id, right)
 
 
-    # --- USUWANIE ---
+    # --- USUWANIE (BOTTOM-UP) ---
     def delete(self, key):
+        # 1. Znajdź węzeł zawierający klucz
         path = self._get_path_to_node(self.root_id, key)
         if not path:
             print(f"Klucz {key} nie istnieje.")
@@ -415,6 +457,9 @@ class BTree:
         target_id, target_idx = path[-1]
         target_node = self.get_node(target_id)
         
+        # 2. Jeśli usuwany klucz jest w węźle wewnętrznym, nie możemy go tak po prostu usunąć.
+        # Musimy go zamienić z poprzednikiem (największym elementem z lewego poddrzewa),
+        # który na pewno znajduje się w liściu.
         if not target_node.is_leaf:
             curr = target_node.children[target_idx]
             path_to_pred = [curr]
@@ -427,10 +472,12 @@ class BTree:
             pred_node_id = path_to_pred[-1]
             pred_node = self.get_node(pred_node_id)
             
+            # Zamiana kluczy miejscami
             target_node.keys[target_idx] = pred_node.keys[-1]
             target_node.values[target_idx] = pred_node.values[-1]
             self.save_node(target_id, target_node)
             
+            # Teraz naszym celem usunięcia jest klucz w liściu (ten, który przenieśliśmy)
             full_path_ids = [p[0] for p in path[:-1]] + [target_id] + path_to_pred
             leaf_id = pred_node_id
             leaf = pred_node
@@ -438,17 +485,21 @@ class BTree:
             del leaf.values[-1]
             self.save_node(leaf_id, leaf)
         else:
+            # Jeśli to liść, usuwamy bezpośrednio
             self.data_mgr.delete_record(target_node.values[target_idx])
             del target_node.keys[target_idx]
             del target_node.values[target_idx]
             self.save_node(target_id, target_node)
             full_path_ids = [p[0] for p in path]
 
+        # 3. Pętla naprawcza (Underflow) - idziemy w górę
         curr_id = full_path_ids.pop()
         curr_node = self.get_node(curr_id)
         
         while len(curr_node.keys) < self.d:
+            # Jeśli dotarliśmy do korzenia
             if not full_path_ids:
+                # Jeśli korzeń opustoszał (ale ma dzieci), skracamy drzewo
                 if len(curr_node.keys) == 0 and not curr_node.is_leaf:
                     new_root_id = curr_node.children[0]
                     self.disk.delete_page(curr_id)
@@ -466,6 +517,8 @@ class BTree:
                     
             compensated = False
             
+            # --- PRÓBA KOMPENSACJI (Pożyczanie) ---
+            # Sprawdź czy sąsiad jest "bogaty" (> d kluczy). Jeśli tak, pożyczamy.
             if idx_in_parent > 0:
                 left_sib_id = parent.children[idx_in_parent - 1]
                 left_sib = self.get_node(left_sib_id)
@@ -484,6 +537,9 @@ class BTree:
             
             if compensated: return True
                 
+            # --- MERGE (SCALANIE) ---
+            # Sąsiedzi są biedni (mają tylko d kluczy). Nie da się pożyczyć.
+            # Musimy scalić węzeł z sąsiadem, pobierając separator z rodzica.
             if idx_in_parent > 0:
                 left_sib_id = parent.children[idx_in_parent - 1]
                 left_sib = self.get_node(left_sib_id)
@@ -493,6 +549,7 @@ class BTree:
                 right_sib = self.get_node(right_sib_id)
                 self._merge_nodes(curr_node, curr_id, parent, right_sib, right_sib_id, idx_in_parent)
             
+            # Po scaleniu rodzic stracił jeden klucz. Pętla while sprawdzi, czy rodzic nie ma teraz za mało kluczy.
             self.save_node(parent_id, parent)
             curr_id = parent_id
             curr_node = parent
@@ -501,6 +558,7 @@ class BTree:
         return True
 
     def _get_path_to_node(self, node_id, key):
+        """Pomocnicza: Znajduje ścieżkę do węzła zawierającego dany klucz."""
         curr = node_id
         path = []
         while True:
@@ -509,6 +567,7 @@ class BTree:
             i = 0
             while i < len(node.keys) and key > node.keys[i]:
                 i += 1
+            # Znaleziono klucz w tym węźle
             if i < len(node.keys) and key == node.keys[i]:
                 path.append((curr, i))
                 return path
@@ -518,18 +577,23 @@ class BTree:
             curr = node.children[i]
 
     def _merge_nodes(self, left, left_id, parent, right, right_id, separator_idx):
+        """Scala dwa węzły (Left + Separator + Right) w jeden (Left)."""
+        # Ściągamy separator z rodzica
         left.keys.append(parent.keys[separator_idx])
         left.values.append(parent.values[separator_idx])
         
+        # Dołączamy klucze i dzieci z prawego brata
         left.keys.extend(right.keys)
         left.values.extend(right.values)
         if not left.is_leaf:
             left.children.extend(right.children)
             
+        # Usuwamy separator i wskaźnik na prawego brata z rodzica
         del parent.keys[separator_idx]
         del parent.values[separator_idx]
         del parent.children[separator_idx + 1]
         
+        # Prawy brat jest teraz pusty i nieużywany - zwalniamy stronę
         self.disk.delete_page(right_id)
         self.save_node(left_id, left)
 
@@ -558,6 +622,7 @@ class BTree:
         print("===========================================\n")
 
     def _traverse_and_print(self, node_id):
+        """Rekurencyjne przejście In-Order."""
         node = self.get_node(node_id)
         if not node: return
         for i in range(len(node.keys)):
@@ -588,7 +653,7 @@ class BTree:
                     self._print_node(child_id, level + 1)
 
 
-# --- NARZĘDZIA POMOCNICZE ---
+# --- NARZĘDZIA POMOCNICZE (EXPERIMENTY, CLI) ---
 
 def clean_files(prefixes):
     for base in prefixes:
@@ -675,6 +740,7 @@ def run_experiment():
     for d in degrees:
         results[d] = {'N': [], 'reads': [], 'writes': [], 'idx_size': []}
         for N in record_counts:
+            # Czyszczenie środowiska przed każdą próbą
             clean_files(["exp_index", "exp_data"])
             disk_idx = DiskManager("exp_index")
             disk_dat = DiskManager("exp_data")
@@ -685,6 +751,7 @@ def run_experiment():
             random.shuffle(keys)
 
             stats.reset()
+            # Wstawianie rekordów
             for k in keys:
                 nums = [random.randint(1, 100) for _ in range(3)]
                 btree.insert(k, nums)
