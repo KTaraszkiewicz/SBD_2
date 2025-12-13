@@ -33,7 +33,6 @@ class DiskManager:
     """
     Symuluje dysk twardy na surowym pliku binarnym.
     Plik jest podzielony na bloki o stałej wielkości (PAGE_SIZE).
-    Strona 0 jest zarezerwowana na metadane (Next_Page_ID, Root_ID).
     """
 
     def __init__(self, filename):
@@ -130,8 +129,6 @@ class DiskManager:
         self.file = open(self.filename, 'r+b')
 
 
-# --- STRUKTURY DANYCH ---
-
 class Record:
     def __init__(self, key, numbers):
         self.key = key
@@ -146,15 +143,13 @@ class Record:
 class BTreeNode:
     def __init__(self, is_leaf=False):
         self.is_leaf = is_leaf
-        self.keys = []  # Lista kluczy
-        self.values = []  # Adresy rekordów w pliku danych
-        self.children = []  # ID stron dzieci w pliku indeksu
+        self.keys = []
+        self.values = []
+        self.children = []
 
     def __repr__(self):
         return f"Node(Leaf={self.is_leaf}, Keys={self.keys})"
 
-
-# --- MANAGERY PLIKÓW ---
 
 class DataFileManager:
     def __init__(self, disk):
@@ -227,13 +222,14 @@ class BTree:
 
         return self.search(key, node.children[i])
 
-    # --- WSTAWIANIE ---
+    # --- WSTAWIANIE ZGODNE Z WYKŁADEM (BOTTOM-UP z KOMPENSACJĄ) ---
     def insert(self, key, numbers):
+        # 1. Sprawdź duplikat
         rec, _, _ = self.search(key)
         if rec:
-            print(f"Błąd: Klucz {key} już istnieje.")
             return False
 
+        # 2. Zapisz dane
         new_record = Record(key, numbers)
         try:
             data_addr = self.data_mgr.insert_record(new_record)
@@ -241,84 +237,301 @@ class BTree:
             print(f"Błąd zapisu rekordu: {e}")
             return False
 
-        root = self.get_node(self.root_id)
-        if len(root.keys) == (2 * self.d):
-            new_root = BTreeNode(is_leaf=False)
-            new_root.children.append(self.root_id)
-            self.split_child(new_root, 0)
-            self.update_root(self.disk.write_page(None, new_root))
-            self.insert_non_full(new_root, key, data_addr)
-        else:
-            self.insert_non_full(root, key, data_addr)
-            self.save_node(self.root_id, root)
+        # 3. Znajdź liść i ścieżkę do niego
+        path = self._get_path_to_leaf(self.root_id, key)
+        if not path:
+            return False
+            
+        leaf_id = path[-1]
+        leaf = self.get_node(leaf_id)
+
+        # 4. Wstaw posortowane do liścia
+        self._insert_to_node_local(leaf, key, data_addr, None)
+        self.save_node(leaf_id, leaf)
+
+        # 5. Obsługa przepełnienia (Overflow) w górę drzewa
+        curr_id = leaf_id
+        curr_node = leaf
+        
+        # Bezpieczne usunięcie liścia ze ścieżki
+        if path:
+            path.pop() 
+        
+        while len(curr_node.keys) > 2 * self.d:
+            # Jeśli to korzeń (ścieżka pusta), musimy go podzielić
+            if not path:
+                new_root = BTreeNode(is_leaf=False)
+                new_root.children.append(curr_id)
+                self._split_child_manual(new_root, 0, curr_node, curr_id)
+                new_root_id = self.disk.write_page(None, new_root)
+                self.update_root(new_root_id)
+                return True
+            
+            parent_id = path[-1]
+            parent = self.get_node(parent_id)
+            
+            # Znajdź indeks u rodzica
+            idx_in_parent = -1
+            for i, child_id in enumerate(parent.children):
+                if child_id == curr_id:
+                    idx_in_parent = i
+                    break
+            
+            # Kompensacja
+            compensated = False
+            if idx_in_parent != -1:
+                # Sprawdź lewego sąsiada
+                if idx_in_parent > 0:
+                    left_sib_id = parent.children[idx_in_parent - 1]
+                    left_sib = self.get_node(left_sib_id)
+                    if len(left_sib.keys) < 2 * self.d:
+                        self._compensate_left(left_sib, left_sib_id, parent, curr_node, curr_id, idx_in_parent - 1)
+                        self.save_node(parent_id, parent)
+                        compensated = True
+                
+                # Sprawdź prawego sąsiada
+                if not compensated and idx_in_parent < len(parent.children) - 1:
+                    right_sib_id = parent.children[idx_in_parent + 1]
+                    right_sib = self.get_node(right_sib_id)
+                    if len(right_sib.keys) < 2 * self.d:
+                        self._compensate_right(curr_node, curr_id, parent, right_sib, right_sib_id, idx_in_parent)
+                        self.save_node(parent_id, parent)
+                        compensated = True
+            
+            if compensated:
+                return True 
+                
+            # --- SPLIT ---
+            target_idx = idx_in_parent if idx_in_parent != -1 else 0
+            self._split_child_manual(parent, target_idx, curr_node, curr_id)
+            self.save_node(parent_id, parent)
+            
+            curr_id = parent_id
+            curr_node = parent
+            
+            # Bezpieczne przejście w górę
+            if path:
+                path.pop()
+
         return True
 
-    def split_child(self, parent, index):
-        child_id = parent.children[index]
-        child = self.get_node(child_id)
+    def _get_path_to_leaf(self, node_id, key):
+        path = []
+        curr = node_id
+        while True:
+            path.append(curr)
+            node = self.get_node(curr)
+            if node is None: break 
+            if node.is_leaf:
+                break
+            i = 0
+            while i < len(node.keys) and key > node.keys[i]:
+                i += 1
+            if i >= len(node.children):
+                curr = node.children[-1]
+            else:
+                curr = node.children[i]
+        return path
+
+    def _insert_to_node_local(self, node, key, val, child_right_id):
+        i = len(node.keys) - 1
+        node.keys.append(0)
+        node.values.append(0)
+        if not node.is_leaf and child_right_id is not None:
+             node.children.append(None)
+
+        while i >= 0 and key < node.keys[i]:
+            node.keys[i+1] = node.keys[i]
+            node.values[i+1] = node.values[i]
+            if not node.is_leaf:
+                node.children[i+2] = node.children[i+1]
+            i -= 1
+        
+        node.keys[i+1] = key
+        node.values[i+1] = val
+        if not node.is_leaf and child_right_id is not None:
+            node.children[i+2] = child_right_id
+
+    def _split_child_manual(self, parent, index, child, child_id):
+        mid_idx = self.d
+        mid_key = child.keys[mid_idx]
+        mid_val = child.values[mid_idx]
+        
         new_node = BTreeNode(is_leaf=child.is_leaf)
-
-        mid_key = child.keys[self.d]
-        mid_val = child.values[self.d]
-
-        new_node.keys = child.keys[self.d + 1:]
-        new_node.values = child.values[self.d + 1:]
+        
+        new_node.keys = child.keys[mid_idx+1:]
+        new_node.values = child.values[mid_idx+1:]
         if not child.is_leaf:
-            new_node.children = child.children[self.d + 1:]
-
-        child.keys = child.keys[:self.d]
-        child.values = child.values[:self.d]
+            new_node.children = child.children[mid_idx+1:]
+            
+        child.keys = child.keys[:mid_idx]
+        child.values = child.values[:mid_idx]
         if not child.is_leaf:
-            child.children = child.children[:self.d + 1]
-
+            child.children = child.children[:mid_idx+1]
+            
         new_node_id = self.disk.write_page(None, new_node)
         self.save_node(child_id, child)
-
-        parent.children.insert(index + 1, new_node_id)
+        
         parent.keys.insert(index, mid_key)
         parent.values.insert(index, mid_val)
+        parent.children.insert(index + 1, new_node_id)
 
-    def insert_non_full(self, node_obj, key, data_addr):
-        i = len(node_obj.keys) - 1
-        if node_obj.is_leaf:
-            node_obj.keys.append(0)
-            node_obj.values.append(0)
-            while i >= 0 and key < node_obj.keys[i]:
-                node_obj.keys[i + 1] = node_obj.keys[i]
-                node_obj.values[i + 1] = node_obj.values[i]
-                i -= 1
-            node_obj.keys[i + 1] = key
-            node_obj.values[i + 1] = data_addr
-        else:
-            while i >= 0 and key < node_obj.keys[i]:
-                i -= 1
-            i += 1
-            child_id = node_obj.children[i]
-            child = self.get_node(child_id)
-            if len(child.keys) == 2 * self.d:
-                self.split_child(node_obj, i)
-                if key > node_obj.keys[i]:
-                    i += 1
-                child_id = node_obj.children[i]
-                child = self.get_node(child_id)
-            self.insert_non_full(child, key, data_addr)
-            self.save_node(child_id, child)
+    def _compensate_right(self, left, left_id, parent, right, right_id, separator_idx):
+        """Przenosi klucz z Lewego do Prawego (Source=Left, Target=Right)."""
+        right.keys.insert(0, parent.keys[separator_idx])
+        right.values.insert(0, parent.values[separator_idx])
+        
+        if not right.is_leaf and left.children:
+            right.children.insert(0, left.children.pop())
+            
+        parent.keys[separator_idx] = left.keys.pop()
+        parent.values[separator_idx] = left.values.pop()
+        
+        self.save_node(left_id, left)
+        self.save_node(right_id, right)
+        
+    def _compensate_left(self, left, left_id, parent, right, right_id, separator_idx):
+        """Przenosi klucz z Prawego do Lewego (Source=Right, Target=Left)."""
+        left.keys.append(parent.keys[separator_idx])
+        left.values.append(parent.values[separator_idx])
+        
+        if not left.is_leaf and right.children:
+            left.children.append(right.children.pop(0))
+            
+        parent.keys[separator_idx] = right.keys.pop(0)
+        parent.values[separator_idx] = right.values.pop(0)
+        
+        self.save_node(left_id, left)
+        self.save_node(right_id, right)
+
 
     # --- USUWANIE ---
     def delete(self, key):
-        if self.search(key)[0] is None:
+        path = self._get_path_to_node(self.root_id, key)
+        if not path:
             print(f"Klucz {key} nie istnieje.")
             return False
+            
+        target_id, target_idx = path[-1]
+        target_node = self.get_node(target_id)
+        
+        if not target_node.is_leaf:
+            curr = target_node.children[target_idx]
+            path_to_pred = [curr]
+            while True:
+                n = self.get_node(curr)
+                if n.is_leaf: break
+                curr = n.children[-1]
+                path_to_pred.append(curr)
+                
+            pred_node_id = path_to_pred[-1]
+            pred_node = self.get_node(pred_node_id)
+            
+            target_node.keys[target_idx] = pred_node.keys[-1]
+            target_node.values[target_idx] = pred_node.values[-1]
+            self.save_node(target_id, target_node)
+            
+            full_path_ids = [p[0] for p in path[:-1]] + [target_id] + path_to_pred
+            leaf_id = pred_node_id
+            leaf = pred_node
+            del leaf.keys[-1]
+            del leaf.values[-1]
+            self.save_node(leaf_id, leaf)
+        else:
+            self.data_mgr.delete_record(target_node.values[target_idx])
+            del target_node.keys[target_idx]
+            del target_node.values[target_idx]
+            self.save_node(target_id, target_node)
+            full_path_ids = [p[0] for p in path]
 
-        root = self.get_node(self.root_id)
-        # Przekazujemy ID korzenia do rekurencji
-        self._delete_recursive(root, self.root_id, key)
-
-        # Sprawdzenie czy korzeń nie opustoszał (skrócenie drzewa)
-        if len(root.keys) == 0 and not root.is_leaf:
-            self.disk.delete_page(self.root_id)
-            self.update_root(root.children[0])
+        curr_id = full_path_ids.pop()
+        curr_node = self.get_node(curr_id)
+        
+        while len(curr_node.keys) < self.d:
+            if not full_path_ids:
+                if len(curr_node.keys) == 0 and not curr_node.is_leaf:
+                    new_root_id = curr_node.children[0]
+                    self.disk.delete_page(curr_id)
+                    self.update_root(new_root_id)
+                return True
+            
+            parent_id = full_path_ids[-1]
+            parent = self.get_node(parent_id)
+            
+            idx_in_parent = -1
+            for i, child_id in enumerate(parent.children):
+                if child_id == curr_id:
+                    idx_in_parent = i
+                    break
+                    
+            compensated = False
+            
+            if idx_in_parent > 0:
+                left_sib_id = parent.children[idx_in_parent - 1]
+                left_sib = self.get_node(left_sib_id)
+                if len(left_sib.keys) > self.d:
+                    self._compensate_right(left_sib, left_sib_id, parent, curr_node, curr_id, idx_in_parent - 1)
+                    self.save_node(parent_id, parent)
+                    compensated = True
+            
+            if not compensated and idx_in_parent < len(parent.children) - 1:
+                right_sib_id = parent.children[idx_in_parent + 1]
+                right_sib = self.get_node(right_sib_id)
+                if len(right_sib.keys) > self.d:
+                    self._compensate_left(curr_node, curr_id, parent, right_sib, right_sib_id, idx_in_parent)
+                    self.save_node(parent_id, parent)
+                    compensated = True
+            
+            if compensated: return True
+                
+            if idx_in_parent > 0:
+                left_sib_id = parent.children[idx_in_parent - 1]
+                left_sib = self.get_node(left_sib_id)
+                self._merge_nodes(left_sib, left_sib_id, parent, curr_node, curr_id, idx_in_parent - 1)
+            else:
+                right_sib_id = parent.children[idx_in_parent + 1]
+                right_sib = self.get_node(right_sib_id)
+                self._merge_nodes(curr_node, curr_id, parent, right_sib, right_sib_id, idx_in_parent)
+            
+            self.save_node(parent_id, parent)
+            curr_id = parent_id
+            curr_node = parent
+            full_path_ids.pop()
+            
         return True
+
+    def _get_path_to_node(self, node_id, key):
+        curr = node_id
+        path = []
+        while True:
+            node = self.get_node(curr)
+            if not node: return []
+            i = 0
+            while i < len(node.keys) and key > node.keys[i]:
+                i += 1
+            if i < len(node.keys) and key == node.keys[i]:
+                path.append((curr, i))
+                return path
+            if node.is_leaf:
+                return []
+            path.append((curr, i))
+            curr = node.children[i]
+
+    def _merge_nodes(self, left, left_id, parent, right, right_id, separator_idx):
+        left.keys.append(parent.keys[separator_idx])
+        left.values.append(parent.values[separator_idx])
+        
+        left.keys.extend(right.keys)
+        left.values.extend(right.values)
+        if not left.is_leaf:
+            left.children.extend(right.children)
+            
+        del parent.keys[separator_idx]
+        del parent.values[separator_idx]
+        del parent.children[separator_idx + 1]
+        
+        self.disk.delete_page(right_id)
+        self.save_node(left_id, left)
 
     def update(self, key, new_numbers):
         rec, node_id, idx = self.search(key)
@@ -336,135 +549,6 @@ class BTree:
             print(f"Klucz {key} nie istnieje.")
             return False
 
-    def _delete_recursive(self, node, node_id, key):
-        idx = 0
-        while idx < len(node.keys) and key > node.keys[idx]:
-            idx += 1
-
-        if idx < len(node.keys) and node.keys[idx] == key:
-            if node.is_leaf:
-                self.data_mgr.delete_record(node.values[idx])
-                del node.keys[idx]
-                del node.values[idx]
-                self.save_node(node_id, node)
-            else:
-                # Zamiana z poprzednikiem
-                pred_child_id = node.children[idx]
-                pred_node = self.get_node(pred_child_id)
-                while not pred_node.is_leaf:
-                    pred_child_id = pred_node.children[-1]
-                    pred_node = self.get_node(pred_child_id)
-
-                predecessor_key = pred_node.keys[-1]
-                predecessor_val = pred_node.values[-1]
-
-                node.keys[idx] = predecessor_key
-                node.values[idx] = predecessor_val
-                self.save_node(node_id, node)
-                # Rekurencyjne usuwanie poprzednika
-                self._delete_recursive(self.get_node(node.children[idx]), node.children[idx], predecessor_key)
-        else:
-            if node.is_leaf:
-                return
-
-            child_id = node.children[idx]
-            child = self.get_node(child_id)
-
-            # Proaktywna naprawa (jeśli dziecko ma minimum kluczy)
-            if len(child.keys) == self.d:
-                # !!! POPRAWKA: Przekazujemy node_id (ID rodzica) !!!
-                self._fix_child(node, node_id, idx, child, child_id)
-
-                # Po naprawie (szczególnie po scalaniu) indeksy mogły się przesunąć
-                if idx > len(node.keys):
-                    idx -= 1
-
-                child_id = node.children[idx]
-                child = self.get_node(child_id)
-
-            self._delete_recursive(child, child_id, key)
-
-    def _fix_child(self, parent, parent_id, idx, child, child_id):
-        # 1. Pożycz od LEWEGO rodzeństwa
-        if idx > 0:
-            left_sibling_id = parent.children[idx - 1]
-            left_sibling = self.get_node(left_sibling_id)
-            if len(left_sibling.keys) > self.d:
-                child.keys.insert(0, parent.keys[idx - 1])
-                child.values.insert(0, parent.values[idx - 1])
-                if not child.is_leaf:
-                    child.children.insert(0, left_sibling.children.pop())
-
-                parent.keys[idx - 1] = left_sibling.keys.pop()
-                parent.values[idx - 1] = left_sibling.values.pop()
-
-                self.save_node(child_id, child)
-                self.save_node(left_sibling_id, left_sibling)
-                # !!! POPRAWKA: Używamy parent_id zamiast None !!!
-                self.save_node(parent_id, parent)
-                return
-
-        # 2. Pożycz od PRAWEGO rodzeństwa
-        if idx < len(parent.children) - 1:
-            right_sibling_id = parent.children[idx + 1]
-            right_sibling = self.get_node(right_sibling_id)
-            if len(right_sibling.keys) > self.d:
-                child.keys.append(parent.keys[idx])
-                child.values.append(parent.values[idx])
-                if not child.is_leaf:
-                    child.children.append(right_sibling.children.pop(0))
-
-                parent.keys[idx] = right_sibling.keys.pop(0)
-                parent.values[idx] = right_sibling.values.pop(0)
-
-                self.save_node(child_id, child)
-                self.save_node(right_sibling_id, right_sibling)
-                # !!! POPRAWKA: Używamy parent_id zamiast None !!!
-                self.save_node(parent_id, parent)
-                return
-
-        # 3. Scalanie (Merge)
-        if idx > 0:
-            # Scal z lewym
-            left_sibling_id = parent.children[idx - 1]
-            left_sibling = self.get_node(left_sibling_id)
-
-            left_sibling.keys.append(parent.keys[idx - 1])
-            left_sibling.values.append(parent.values[idx - 1])
-            left_sibling.keys.extend(child.keys)
-            left_sibling.values.extend(child.values)
-            if not left_sibling.is_leaf:
-                left_sibling.children.extend(child.children)
-
-            del parent.keys[idx - 1]
-            del parent.values[idx - 1]
-            del parent.children[idx]
-
-            self.disk.delete_page(child_id)
-            self.save_node(left_sibling_id, left_sibling)
-            # !!! POPRAWKA: Używamy parent_id !!!
-            self.save_node(parent_id, parent)
-        else:
-            # Scal z prawym
-            right_sibling_id = parent.children[idx + 1]
-            right_sibling = self.get_node(right_sibling_id)
-
-            child.keys.append(parent.keys[idx])
-            child.values.append(parent.values[idx])
-            child.keys.extend(right_sibling.keys)
-            child.values.extend(right_sibling.values)
-            if not child.is_leaf:
-                child.children.extend(right_sibling.children)
-
-            del parent.keys[idx]
-            del parent.values[idx]
-            del parent.children[idx + 1]
-
-            self.disk.delete_page(right_sibling_id)
-            self.save_node(child_id, child)
-            self.save_node(parent_id, parent)
-
-    # --- POZOSTAŁE METODY ---
     def print_ordered_records(self):
         print("\n=== Sekwencyjny odczyt bazy (wg klucza) ===")
         if self.root_id is not None:
@@ -476,7 +560,6 @@ class BTree:
     def _traverse_and_print(self, node_id):
         node = self.get_node(node_id)
         if not node: return
-
         for i in range(len(node.keys)):
             if not node.is_leaf:
                 self._traverse_and_print(node.children[i])
@@ -484,7 +567,6 @@ class BTree:
             record_addr = node.values[i]
             record = self.data_mgr.read_record(record_addr)
             print(f"Klucz: {key:<6} -> {record}")
-
         if not node.is_leaf:
             self._traverse_and_print(node.children[-1])
 
@@ -624,14 +706,29 @@ def run_experiment():
 
 
 def generate_plots(results):
+    # Wykres 1: Odczyty
     plt.figure(figsize=(10, 5))
     for d, data in results.items():
         plt.plot(data['N'], data['reads'], marker='o', label=f'd={d}')
     plt.title('Średnie odczyty vs N')
+    plt.xlabel('Liczba rekordów (N)')
+    plt.ylabel('Średnie odczyty')
     plt.legend()
     plt.grid(True)
     plt.savefig('wykres_odczyty.png')
     print("Wygenerowano: wykres_odczyty.png")
+
+    # Wykres 2: Rozmiar Indeksu
+    plt.figure(figsize=(10, 5))
+    for d, data in results.items():
+        plt.plot(data['N'], data['idx_size'], marker='s', linestyle='--', label=f'd={d}')
+    plt.title('Rozmiar pliku indeksu vs N')
+    plt.xlabel('Liczba rekordów (N)')
+    plt.ylabel('Rozmiar (Bajty)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('wykres_rozmiar.png')
+    print("Wygenerowano: wykres_rozmiar.png")
 
 
 def interactive_mode():
@@ -708,12 +805,10 @@ def interactive_mode():
                 btree.print_tree()
                 print_data_file(data_mgr)
 
-            # --- ZAKTUALIZOWANA CZĘŚĆ MENU ---
             elif op == "scan":
                 stats.reset()
                 btree.print_ordered_records()
                 print(f"IO (Przeglądanie całości): {stats}")
-            # ---------------------------------
 
             elif op == "script":
                 if len(cmd_parts) < 2: continue
