@@ -224,7 +224,7 @@ class BTree:
         node = self.get_node(node_id)
         if node is None: return None, None, None
 
-        # Proste przeszukiwanie liniowe wewnątrz węzła (można by użyć bisekcji)
+        # Proste przeszukiwanie liniowe wewnątrz węzła
         i = 0
         while i < len(node.keys) and key > node.keys[i]:
             i += 1
@@ -240,12 +240,12 @@ class BTree:
         # Schodzimy do odpowiedniego dziecka
         return self.search(key, node.children[i])
 
-    # --- WSTAWIANIE (BOTTOM-UP z KOMPENSACJĄ) ---
-    # Zgodnie z wykładem: Wstaw do liścia -> Sprawdź przepełnienie -> Kompensuj -> Jak się nie da, to Split -> W górę
+    # --- WSTAWIANIE ZGODNE Z WYKŁADEM (BOTTOM-UP z KOMPENSACJĄ) ---
     def insert(self, key, numbers):
         # 1. Sprawdź duplikat
         rec, _, _ = self.search(key)
         if rec:
+            # Zwracamy False, aby sygnalizować duplikat warstwie interfejsu
             return False
 
         # 2. Zapisz dane fizycznie w pliku danych
@@ -257,7 +257,6 @@ class BTree:
             return False
 
         # 3. Znajdź liść, do którego powinien trafić klucz.
-        # Musimy zapamiętać ścieżkę (path), żeby potem móc wracać w górę (Bottom-Up).
         path = self._get_path_to_leaf(self.root_id, key)
         if not path:
             return False
@@ -265,23 +264,18 @@ class BTree:
         leaf_id = path[-1]
         leaf = self.get_node(leaf_id)
 
-        # 4. Wstaw klucz do liścia (w pamięci RAM), dbając o sortowanie.
-        # Na tym etapie ignorujemy limit 2d, po prostu wpychamy dane.
+        # 4. Wstaw klucz do liścia
         self._insert_to_node_local(leaf, key, data_addr, None)
         self.save_node(leaf_id, leaf)
 
-        # 5. Pętla naprawcza (idziemy w górę drzewa)
-        # Sprawdzamy, czy węzeł nie "pękł w szwach" (Overflow: len > 2d)
+        # 5. Pętla naprawcza (Overflow)
         curr_id = leaf_id
         curr_node = leaf
         
-        # Zdejmujemy liść ze stosu ścieżki, bo już go mamy w curr_node
         if path:
             path.pop() 
         
         while len(curr_node.keys) > 2 * self.d:
-            # PRZYPADEK SPECJALNY: Przepełniony korzeń.
-            # Musimy stworzyć nowy korzeń i podzielić stary. Drzewo rośnie w górę.
             if not path:
                 new_root = BTreeNode(is_leaf=False)
                 new_root.children.append(curr_id)
@@ -290,32 +284,25 @@ class BTree:
                 self.update_root(new_root_id)
                 return True
             
-            # Pobieramy rodzica ze ścieżki
             parent_id = path[-1]
             parent = self.get_node(parent_id)
             
-            # Szukamy, którym dzieckiem rodzica jest nasz bieżący węzeł
             idx_in_parent = -1
             for i, child_id in enumerate(parent.children):
                 if child_id == curr_id:
                     idx_in_parent = i
                     break
             
-            # --- PRÓBA KOMPENSACJI (Redystrybucja) ---
-            # Zanim podzielimy węzeł, sprawdzamy czy sąsiad nie ma wolnego miejsca.
             compensated = False
             if idx_in_parent != -1:
-                # 1. Sprawdź lewego sąsiada
                 if idx_in_parent > 0:
                     left_sib_id = parent.children[idx_in_parent - 1]
                     left_sib = self.get_node(left_sib_id)
-                    # Jeśli sąsiad ma miejsce (< 2d), oddajemy mu nadmiar
                     if len(left_sib.keys) < 2 * self.d:
                         self._compensate_left(left_sib, left_sib_id, parent, curr_node, curr_id, idx_in_parent - 1)
                         self.save_node(parent_id, parent)
                         compensated = True
                 
-                # 2. Sprawdź prawego sąsiada (jeśli lewy był pełny)
                 if not compensated and idx_in_parent < len(parent.children) - 1:
                     right_sib_id = parent.children[idx_in_parent + 1]
                     right_sib = self.get_node(right_sib_id)
@@ -325,15 +312,12 @@ class BTree:
                         compensated = True
             
             if compensated:
-                return True # Udało się upchnąć u sąsiada, koniec naprawiania.
-                
-            # --- SPLIT (PODZIAŁ) ---
-            # Sąsiedzi są pełni. Musimy rozciąć węzeł na dwa i wypchnąć środkowy klucz do rodzica.
+                return True 
+            
             target_idx = idx_in_parent if idx_in_parent != -1 else 0
             self._split_child_manual(parent, target_idx, curr_node, curr_id)
             self.save_node(parent_id, parent)
             
-            # Przesuwamy się w górę: teraz to rodzic może być przepełniony (bo dostał klucz).
             curr_id = parent_id
             curr_node = parent
             
@@ -446,7 +430,7 @@ class BTree:
         self.save_node(right_id, right)
 
 
-    # --- USUWANIE (BOTTOM-UP) ---
+    # --- USUWANIE ---
     def delete(self, key):
         # 1. Znajdź węzeł zawierający klucz
         path = self._get_path_to_node(self.root_id, key)
@@ -457,10 +441,9 @@ class BTree:
         target_id, target_idx = path[-1]
         target_node = self.get_node(target_id)
         
-        # 2. Jeśli usuwany klucz jest w węźle wewnętrznym, nie możemy go tak po prostu usunąć.
-        # Musimy go zamienić z poprzednikiem (największym elementem z lewego poddrzewa),
-        # który na pewno znajduje się w liściu.
+        # 2. Jeśli usuwany klucz jest w węźle wewnętrznym
         if not target_node.is_leaf:
+            # Znajdź poprzednika
             curr = target_node.children[target_idx]
             path_to_pred = [curr]
             while True:
@@ -472,15 +455,23 @@ class BTree:
             pred_node_id = path_to_pred[-1]
             pred_node = self.get_node(pred_node_id)
             
-            # Zamiana kluczy miejscami
+            # Usuń stary rekord danych ZANIM zostanie nadpisany
+            # Pobieramy adres rekordu, który zaraz zniknie z indeksu
+            old_data_addr = target_node.values[target_idx]
+            self.data_mgr.delete_record(old_data_addr)
+            # -------------------------------------------------------------
+
+            # Zamiana kluczy miejscami (nadpisanie celu poprzednikiem)
             target_node.keys[target_idx] = pred_node.keys[-1]
             target_node.values[target_idx] = pred_node.values[-1]
             self.save_node(target_id, target_node)
             
-            # Teraz naszym celem usunięcia jest klucz w liściu (ten, który przenieśliśmy)
+            # Teraz usuwamy wpis poprzednika z liścia (bo przenieśliśmy go wyżej)
             full_path_ids = [p[0] for p in path[:-1]] + [target_id] + path_to_pred
             leaf_id = pred_node_id
             leaf = pred_node
+            
+            # Uwaga: Nie usuwamy recordu poprzednika, bo on "żyje" teraz w węźle wyżej!
             del leaf.keys[-1]
             del leaf.values[-1]
             self.save_node(leaf_id, leaf)
@@ -497,12 +488,11 @@ class BTree:
         curr_node = self.get_node(curr_id)
         
         while len(curr_node.keys) < self.d:
-            # Jeśli dotarliśmy do korzenia
             if not full_path_ids:
-                # Jeśli korzeń opustoszał (ale ma dzieci), skracamy drzewo
+                # Jeśli korzeń opustoszał
                 if len(curr_node.keys) == 0 and not curr_node.is_leaf:
                     new_root_id = curr_node.children[0]
-                    self.disk.delete_page(curr_id)
+                    self.disk.delete_page(curr_id) # Usuwamy starą stronę indeksu korzenia
                     self.update_root(new_root_id)
                 return True
             
@@ -517,8 +507,7 @@ class BTree:
                     
             compensated = False
             
-            # --- PRÓBA KOMPENSACJI (Pożyczanie) ---
-            # Sprawdź czy sąsiad jest "bogaty" (> d kluczy). Jeśli tak, pożyczamy.
+            # Kompensacja z prawego
             if idx_in_parent > 0:
                 left_sib_id = parent.children[idx_in_parent - 1]
                 left_sib = self.get_node(left_sib_id)
@@ -527,6 +516,7 @@ class BTree:
                     self.save_node(parent_id, parent)
                     compensated = True
             
+            # Kompensacja z lewego
             if not compensated and idx_in_parent < len(parent.children) - 1:
                 right_sib_id = parent.children[idx_in_parent + 1]
                 right_sib = self.get_node(right_sib_id)
@@ -536,10 +526,8 @@ class BTree:
                     compensated = True
             
             if compensated: return True
-                
-            # --- MERGE (SCALANIE) ---
-            # Sąsiedzi są biedni (mają tylko d kluczy). Nie da się pożyczyć.
-            # Musimy scalić węzeł z sąsiadem, pobierając separator z rodzica.
+            
+            # Scalanie (Merge)
             if idx_in_parent > 0:
                 left_sib_id = parent.children[idx_in_parent - 1]
                 left_sib = self.get_node(left_sib_id)
@@ -549,7 +537,6 @@ class BTree:
                 right_sib = self.get_node(right_sib_id)
                 self._merge_nodes(curr_node, curr_id, parent, right_sib, right_sib_id, idx_in_parent)
             
-            # Po scaleniu rodzic stracił jeden klucz. Pętla while sprawdzi, czy rodzic nie ma teraz za mało kluczy.
             self.save_node(parent_id, parent)
             curr_id = parent_id
             curr_node = parent
@@ -830,8 +817,16 @@ def interactive_mode():
                     key = int(cmd_parts[1])
                     nums = [int(x) for x in cmd_parts[2:]]
                     stats.reset()
-                    btree.insert(key, nums)
-                    print(f"IO: {stats}")
+                    
+                    # Wywołanie insert i sprawdzenie wyniku
+                    success = btree.insert(key, nums)
+                    
+                    if success:
+                        print(f"Dodano rekord. IO: {stats}")
+                    else:
+                        print(f"Klucz {key} już istnieje. Aby zmienić wartość rekordu, użyj komendy 'upd'.")
+                        print(f"IO (sprawdzenie): {stats}")
+                        
                 except ValueError:
                     print("Błąd danych.")
             elif op == "upd":
