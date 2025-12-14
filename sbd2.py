@@ -156,7 +156,7 @@ class BTreeNode:
     def __init__(self, is_leaf=False):
         self.is_leaf = is_leaf
         self.keys = []
-        self.values = []    # Adresy do pliku danych (dla liści) lub do poddrzew (dla węzłów wewn. - zależnie od implementacji)
+        self.values = []    # Adresy do pliku danych (dla liści) lub do poddrzew
         self.children = []  # ID stron dzieci w pliku indeksu
 
     def __repr__(self):
