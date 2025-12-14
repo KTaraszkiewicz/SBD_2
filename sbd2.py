@@ -240,7 +240,7 @@ class BTree:
         # Schodzimy do odpowiedniego dziecka
         return self.search(key, node.children[i])
 
-    # --- WSTAWIANIE ZGODNE Z WYKŁADEM (BOTTOM-UP z KOMPENSACJĄ) ---
+    # --- WSTAWIANIE (BOTTOM-UP z KOMPENSACJĄ) ---
     def insert(self, key, numbers):
         # 1. Sprawdź duplikat
         rec, _, _ = self.search(key)
@@ -795,7 +795,7 @@ def interactive_mode():
 
     btree = BTree(2, idx_disk, data_mgr)
 
-    print("System B-Drzewa (Zadanie 2) - BINARY MODE.")
+    print("System B-Drzewa")
     print("Wpisz 'help' aby zobaczyć listę komend.")
 
     while True:
